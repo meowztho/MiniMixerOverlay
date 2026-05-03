@@ -1,0 +1,167 @@
+<Window x:Class="MiniMixerOverlay.UI.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Mini Mixer"
+        Width="380" Height="520"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False"
+        ResizeMode="NoResize">
+
+    <Window.Resources>
+        <SolidColorBrush x:Key="Accent" Color="#00D4FF"/>
+        <SolidColorBrush x:Key="Text" Color="#F0F0F0"/>
+        <SolidColorBrush x:Key="Muted" Color="#777799"/>
+        <SolidColorBrush x:Key="Surface" Color="#1E1E36" Opacity="0.95"/>
+        <SolidColorBrush x:Key="Edge" Color="#3A3A5C" Opacity="0.6"/>
+        <SolidColorBrush x:Key="CardBg" Color="#28284A"/>
+    </Window.Resources>
+
+    <!-- Kapsel-Hülle -->
+    <Border CornerRadius="18"
+            Background="{StaticResource Surface}"
+            BorderBrush="{StaticResource Edge}"
+            BorderThickness="1"
+            MouseDown="Window_MouseDown">
+        <Border.Effect>
+            <DropShadowEffect Color="Black" Opacity="0.45" BlurRadius="20" ShadowDepth="0"/>
+        </Border.Effect>
+
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="44"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="30"/>
+            </Grid.RowDefinitions>
+
+            <!-- ═══ HEADER ═══ -->
+            <Border Grid.Row="0" CornerRadius="18,18,0,0"
+                    Background="#16162A" MouseDown="Window_MouseDown">
+                <Grid Margin="14,0">
+                    <TextBlock Text="🎛  Mini Mixer"
+                               Foreground="{StaticResource Text}"
+                               FontSize="14" FontWeight="SemiBold"
+                               VerticalAlignment="Center"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                        <Button x:Name="BtnMinimize" Width="28" Height="28"
+                                Background="Transparent" BorderBrush="Transparent"
+                                Foreground="{StaticResource Text}" FontSize="13"
+                                Content="─" ToolTip="Minimieren"
+                                Click="BtnMinimize_Click" Margin="0,0,4,0"/>
+                        <Button x:Name="BtnClose" Width="28" Height="28"
+                                Background="Transparent" BorderBrush="Transparent"
+                                Foreground="#FF6B6B" FontSize="13"
+                                Content="✕" ToolTip="Beenden"
+                                Click="BtnClose_Click"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- ═══ FILTER ═══ -->
+            <Border Grid.Row="1" Margin="12,8,12,4" Padding="10,6"
+                    CornerRadius="10" Background="#16162A">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+                             Background="Transparent" BorderBrush="Transparent"
+                             Foreground="{StaticResource Text}" FontSize="12"
+                             Padding="4,2"/>
+                    <ToggleButton Grid.Column="1"
+                                  IsChecked="{Binding ShowOnlyActive}"
+                                  Background="Transparent" BorderBrush="{StaticResource Edge}"
+                                  Foreground="{StaticResource Muted}" FontSize="10"
+                                  Content="🔊 Aktiv"
+                                  Width="70" Height="24" Cursor="Hand"/>
+                </Grid>
+            </Border>
+
+            <!-- ═══ LIST ═══ -->
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Padding="12,4">
+                <ItemsControl ItemsSource="{Binding FilteredEntries}">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border Background="{StaticResource CardBg}"
+                                    CornerRadius="12" Margin="0,0,0,6" Padding="12,8">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="38"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="65"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto"/>
+                                        <RowDefinition Height="Auto"/>
+                                    </Grid.RowDefinitions>
+
+                                     <!-- Icon -->
+                                     <Border Grid.Row="0" Grid.RowSpan="2" Grid.Column="0"
+                                             Width="34" Height="34"
+                                             Background="#1A1A34" CornerRadius="8"
+                                             Margin="0,0,10,0">
+                                         <TextBlock FontSize="16"
+                                                    HorizontalAlignment="Center"
+                                                    VerticalAlignment="Center">
+                                             <TextBlock.Style>
+                                                 <Style TargetType="TextBlock">
+                                                     <Setter Property="Text" Value="🎵"/>
+                                                     <Style.Triggers>
+                                                         <DataTrigger Binding="{Binding IsSystemSound}" Value="True">
+                                                             <Setter Property="Text" Value="🔊"/>
+                                                         </DataTrigger>
+                                                     </Style.Triggers>
+                                                 </Style>
+                                             </TextBlock.Style>
+                                         </TextBlock>
+                                     </Border>
+
+                                    <!-- Name -->
+                                    <TextBlock Grid.Row="0" Grid.Column="1"
+                                               Text="{Binding DisplayName}"
+                                               Foreground="{StaticResource Text}"
+                                               FontSize="12" FontWeight="Medium"
+                                               TextTrimming="CharacterEllipsis"
+                                               Margin="0,2,0,0"/>
+
+                                    <!-- Exe -->
+                                    <TextBlock Grid.Row="1" Grid.Column="1"
+                                               Text="{Binding ExeName}"
+                                               Foreground="{StaticResource Muted}"
+                                               FontSize="9"
+                                               TextTrimming="CharacterEllipsis"/>
+
+                                    <!-- Volume % -->
+                                    <TextBlock Grid.Row="0" Grid.Column="2"
+                                               Text="{Binding CombinedVolume, StringFormat={}{0:F0}%}"
+                                               Foreground="{StaticResource Accent}"
+                                               FontSize="15" FontWeight="Bold"
+                                               HorizontalAlignment="Right"/>
+
+                                    <!-- Slider -->
+                                    <Slider Grid.Row="1" Grid.Column="2"
+                                            Minimum="0" Maximum="100"
+                                            Value="{Binding CombinedVolume, Mode=TwoWay}"
+                                            Foreground="{StaticResource Accent}"
+                                            Height="18" Margin="0,2,0,0"
+                                            Cursor="Hand"/>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+
+            <!-- ═══ STATUS BAR ═══ -->
+            <Border Grid.Row="3" CornerRadius="0,0,18,18" Background="#16162A" Margin="1,0,0,0">
+                <TextBlock Text="{Binding StatusMessage}"
+                           Foreground="{StaticResource Muted}" FontSize="9"
+                           Margin="14,0" VerticalAlignment="Center"/>
+            </Border>
+        </Grid>
+    </Border>
+</Window>

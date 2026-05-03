@@ -1,0 +1,40 @@
+## .NET
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+*.log
+*.nuget.props
+*.nuget.targets
+*.cache
+*.pidb
+*.suo
+*.user
+*.userprefs
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## IDE
+.vs/
+*.suo
+*.user
+.vscode/
+.idea/
+
+## Build
+publish/
+dist/
+build/
+
+## OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+## Agent Docs (nur fuer Entwicklung)
+Docs/
+Obsidian-Start.md
+
+## App Data
+*.tmp
+*.bak

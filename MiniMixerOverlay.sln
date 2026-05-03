@@ -1,0 +1,48 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{A577CBAD-94E9-4ADA-9813-C32FD755730B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MiniMixerOverlay.Core", "src\MiniMixerOverlay.Core\MiniMixerOverlay.Core.csproj", "{3EBE8287-1F56-485A-9887-3B3586CBDB48}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MiniMixerOverlay.Infrastructure", "src\MiniMixerOverlay.Infrastructure\MiniMixerOverlay.Infrastructure.csproj", "{208173C7-D0A5-4DD1-8480-6F2BD3C8F236}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MiniMixerOverlay.UI", "src\MiniMixerOverlay.UI\MiniMixerOverlay.UI.csproj", "{2A32F6E2-ACB1-4C94-A006-A62837722EED}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MiniMixerOverlay.App", "src\MiniMixerOverlay.App\MiniMixerOverlay.App.csproj", "{CC9B5968-3EDA-4EA9-8DF1-84E1C46E7F84}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{3EBE8287-1F56-485A-9887-3B3586CBDB48}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{3EBE8287-1F56-485A-9887-3B3586CBDB48}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{3EBE8287-1F56-485A-9887-3B3586CBDB48}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{3EBE8287-1F56-485A-9887-3B3586CBDB48}.Release|Any CPU.Build.0 = Release|Any CPU
+		{208173C7-D0A5-4DD1-8480-6F2BD3C8F236}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{208173C7-D0A5-4DD1-8480-6F2BD3C8F236}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{208173C7-D0A5-4DD1-8480-6F2BD3C8F236}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{208173C7-D0A5-4DD1-8480-6F2BD3C8F236}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2A32F6E2-ACB1-4C94-A006-A62837722EED}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2A32F6E2-ACB1-4C94-A006-A62837722EED}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2A32F6E2-ACB1-4C94-A006-A62837722EED}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2A32F6E2-ACB1-4C94-A006-A62837722EED}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CC9B5968-3EDA-4EA9-8DF1-84E1C46E7F84}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CC9B5968-3EDA-4EA9-8DF1-84E1C46E7F84}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CC9B5968-3EDA-4EA9-8DF1-84E1C46E7F84}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CC9B5968-3EDA-4EA9-8DF1-84E1C46E7F84}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{3EBE8287-1F56-485A-9887-3B3586CBDB48} = {A577CBAD-94E9-4ADA-9813-C32FD755730B}
+		{208173C7-D0A5-4DD1-8480-6F2BD3C8F236} = {A577CBAD-94E9-4ADA-9813-C32FD755730B}
+		{2A32F6E2-ACB1-4C94-A006-A62837722EED} = {A577CBAD-94E9-4ADA-9813-C32FD755730B}
+		{CC9B5968-3EDA-4EA9-8DF1-84E1C46E7F84} = {A577CBAD-94E9-4ADA-9813-C32FD755730B}
+	EndGlobalSection
+EndGlobal
