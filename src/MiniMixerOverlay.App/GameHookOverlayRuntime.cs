@@ -13,7 +13,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 
-internal sealed class GameHookOverlayRuntime : IDisposable
+internal sealed partial class GameHookOverlayRuntime : IDisposable
 {
     private const int WsPopup = unchecked((int)0x80000000);
     private static readonly IntPtr HwndMessage = new(-3);
@@ -27,6 +27,13 @@ internal sealed class GameHookOverlayRuntime : IDisposable
     private const int WmIpcCloseLink = WmIpcConnectLinkAck + 1;
 
     private const int OverlayIpcMsgId = 100;
+    // Bound each IPC wait to 40ms; a failed peer is evicted after one timeout.
+    // SendMessageTimeout must remain synchronous for WM_COPYDATA's temporary pointer.
+    private const uint IpcSendTimeoutMs = 40;
+    private const long RecoveryRetryMs = 1000;
+    private const long RecoveryWindowMs = 30000;
+    private const uint SmtoBlock = 0x0001;
+    private const uint SmtoAbortIfHung = 0x0002;
 
     private readonly Window _overlayWindow;
     private readonly Action<string>? _status;
@@ -38,6 +45,11 @@ internal sealed class GameHookOverlayRuntime : IDisposable
     private WndProcDelegate? _wndProcDelegate;
 
     private readonly Dictionary<uint, RemoteClient> _clients = new();
+    // Timeout eviction removes the active client, but its PID-only close may
+    // still be queued. Carry that legacy ambiguity into a later reconnect.
+    private readonly Dictionary<uint, int> _pendingCloseAfterEviction = new();
+    // One bounded retry candidate per PID. No new timer or injector is used.
+    private readonly Dictionary<uint, RecoveryCandidate> _recoveryCandidates = new();
     private readonly JsonSerializerOptions _jsonOptions = new(JsonSerializerDefaults.Web);
 
     private DispatcherTimer? _frameTimer;
@@ -49,22 +61,81 @@ internal sealed class GameHookOverlayRuntime : IDisposable
     private int _frameBufferCapacity;
     private long _nextFrameBufferVersion = 1;
 
+    // Optional second WPF surface for explicitly compatible native clients.
+    // Clients without the independent auxiliary-frame capability receive no auxiliary frames.
+    private Window? _auxiliaryWindow;
+    private MemoryMappedFile? _auxiliaryMap;
+    private MemoryMappedViewAccessor? _auxiliaryView;
+    private string _auxiliaryBufferName = string.Empty;
+    private int _auxiliaryCapacity;
+    private uint _auxiliaryWindowId;
+    private Rect _lastAuxiliaryRect = Rect.Empty;
+    private bool _auxiliaryWasVisible;
+
     private uint _overlayWindowId;
     private uint _overlayNativeHandle;
 
     private Rect _lastSentRect = Rect.Empty;
     private bool _inputInterceptEnabled;
     private bool _forwardGameInputToWindow;
+    private bool _forwardNativeMainInput;
+
+    // Main native cursor forwarding is deliberately separate from the
+    // existing sphere-only experimental test toggle.
+    public bool ForwardNativeMainInput
+    {
+        get => _forwardNativeMainInput;
+        set
+        {
+            if (!_dispatcher.CheckAccess())
+            {
+                _dispatcher.Invoke(() => ForwardNativeMainInput = value);
+                return;
+            }
+            if (_forwardNativeMainInput == value) return;
+            _forwardNativeMainInput = value;
+            PublishMainInputPolicy();
+        }
+    }
 
     public bool IsRunning => _ipcWindow != IntPtr.Zero;
+
+    public void SetAuxiliaryWindow(Window? window)
+    {
+        if (!_dispatcher.CheckAccess())
+        {
+            _dispatcher.Invoke(() => SetAuxiliaryWindow(window));
+            return;
+        }
+        if (ReferenceEquals(_auxiliaryWindow, window)) return;
+        _auxiliaryWindow = window;
+        if (_auxiliaryWasVisible)
+            BroadcastAuxiliaryMessage("experimental.aux.hidden",
+                JsonSerializer.Serialize(new { type = "experimental.aux.hidden" }, _jsonOptions));
+        _auxiliaryWindowId = 0;
+        _lastAuxiliaryRect = Rect.Empty;
+        _auxiliaryWasVisible = false;
+        ReleaseAuxiliaryBuffer();
+    }
 
     public bool ForwardGameInputToWindow
     {
         get => _forwardGameInputToWindow;
-        set => _forwardGameInputToWindow = value;
+        set
+        {
+            if (!_dispatcher.CheckAccess())
+            {
+                _dispatcher.Invoke(() => ForwardGameInputToWindow = value);
+                return;
+            }
+            if (_forwardGameInputToWindow == value) return;
+            _forwardGameInputToWindow = value;
+            PublishAuxiliaryInputPolicy();
+            PublishMainInputPolicy();
+        }
     }
 
-    public GameHookOverlayRuntime(Window overlayWindow, Action<string>? statusCallback = null, string hostName = "n_overlay_1a1y2o8l0b")
+    public GameHookOverlayRuntime(Window overlayWindow, Action<string>? statusCallback = null, string hostName = "minimixer_graphics_v1")
     {
         _overlayWindow = overlayWindow;
         _status = statusCallback;
@@ -165,6 +236,8 @@ internal sealed class GameHookOverlayRuntime : IDisposable
             _ = PostMessage(client.RemoteWindow, WmIpcCloseLink, new IntPtr((int)GetCurrentProcessId()), IntPtr.Zero);
         }
         _clients.Clear();
+        _pendingCloseAfterEviction.Clear();
+        _recoveryCandidates.Clear();
 
         if (_ipcWindow != IntPtr.Zero)
         {
@@ -188,6 +261,9 @@ internal sealed class GameHookOverlayRuntime : IDisposable
         _frameBufferMap = null;
         _frameBufferCapacity = 0;
         _bufferName = string.Empty;
+        ReleaseAuxiliaryBuffer();
+        _auxiliaryWasVisible = false;
+        _lastAuxiliaryRect = Rect.Empty;
 
         Notify("Game-Hook Runtime gestoppt.");
     }
@@ -216,10 +292,14 @@ internal sealed class GameHookOverlayRuntime : IDisposable
 
     private void PushFrame()
     {
-        if (_clients.Count == 0 || _overlayWindow.WindowState == WindowState.Minimized || !_overlayWindow.IsVisible)
-        {
+        RecoverResponsiveClients();
+        if (_clients.Count == 0) return;
+        PushAuxiliaryFrame();
+
+        // The independently visible sphere still publishes while the main
+        // WPF mixer is hidden/collapsed. Original main-surface IPC unchanged.
+        if (_overlayWindow.WindowState == WindowState.Minimized || !_overlayWindow.IsVisible)
             return;
-        }
 
         if (!TryCaptureWindowPixels(_overlayWindow, out var pixelWidth, out var pixelHeight, out var pixels))
         {
@@ -233,35 +313,65 @@ internal sealed class GameHookOverlayRuntime : IDisposable
 
         CreateOrResizeSharedFrameBuffer(pixelWidth, pixelHeight);
 
+        TryWriteAndNotifyFrame(_shareMutex, _frameBufferView, pixelWidth, pixelHeight,
+            pixels, () =>
+            {
+                var frameMessage = new
+                {
+                    type = "window.framebuffer",
+                    windowId = _overlayWindowId
+                };
+                BroadcastOverlayMessage("window.framebuffer",
+                    JsonSerializer.Serialize(frameMessage, _jsonOptions));
+            });
+    }
+
+    // A timeout is not ownership. The frame and its notification must be
+    // committed together from the consumer's point of view: never publish a
+    // failed/partial write. Abandonment is fail-closed, but still requires release
+    // because WaitOne transfers ownership before throwing.
+    private static bool TryWriteAndNotifyFrame(
+        Mutex? shareMutex, MemoryMappedViewAccessor? view,
+        int width, int height, byte[] pixels, Action notifyFrame)
+    {
+        if (shareMutex == null || view == null) return false;
+
+        var acquired = false;
+        var released = false;
         try
         {
-            _shareMutex?.WaitOne(8);
-            _frameBufferView?.Write(0, pixelWidth);
-            _frameBufferView?.Write(4, pixelHeight);
-            _frameBufferView?.WriteArray(8, pixels, 0, pixels.Length);
+            acquired = shareMutex.WaitOne(8);
+            if (!acquired) return false;
+
+            view.Write(0, width);
+            view.Write(4, height);
+            view.WriteArray(8, pixels, 0, pixels.Length);
+        }
+        catch (AbandonedMutexException)
+        {
+            acquired = true;
+            return false;
         }
         catch
         {
-            // ignore frame write hiccups
+            return false;
         }
         finally
         {
-            try
+            if (acquired)
             {
-                _shareMutex?.ReleaseMutex();
-            }
-            catch
-            {
-                // ignore if not held
+                try
+                {
+                    shareMutex.ReleaseMutex();
+                    released = true;
+                }
+                catch (ApplicationException) { /* no frame published */ }
             }
         }
 
-        var frameMessage = new
-        {
-            type = "window.framebuffer",
-            windowId = _overlayWindowId
-        };
-        BroadcastOverlayMessage("window.framebuffer", JsonSerializer.Serialize(frameMessage, _jsonOptions));
+        if (!released) return false;
+        notifyFrame();
+        return true;
     }
 
     private void CreateOrResizeSharedFrameBuffer(int width, int height)
@@ -415,11 +525,29 @@ internal sealed class GameHookOverlayRuntime : IDisposable
             return;
         }
 
+        _recoveryCandidates.Remove(processId);
+        // Legacy WM_IPC_CLOSELINK identifies only the PID, not the HWND.
+        // A replacement connection must survive a late close for the previous
+        // window. A duplicate connect for the same HWND is not a replacement.
+        var supersededCloses = 0;
+        if (_pendingCloseAfterEviction.Remove(processId, out var pendingCloses))
+            supersededCloses = pendingCloses;
+        if (_clients.TryGetValue(processId, out var previous))
+        {
+            supersededCloses = previous.SupersededCloseCount;
+            if (previous.RemoteWindow != remoteWindow &&
+                supersededCloses < int.MaxValue)
+            {
+                supersededCloses++;
+            }
+        }
+
         _clients[processId] = new RemoteClient
         {
             ProcessId = processId,
             RemoteWindow = remoteWindow,
-            OverlayInitialized = false
+            OverlayInitialized = false,
+            SupersededCloseCount = supersededCloses
         };
 
         _ = PostMessage(remoteWindow, WmIpcConnectLinkAck, new IntPtr((int)GetCurrentProcessId()), IntPtr.Zero);
@@ -429,8 +557,42 @@ internal sealed class GameHookOverlayRuntime : IDisposable
     private void HandleClientClose(IntPtr processIdPtr)
     {
         var pid = (uint)processIdPtr.ToInt64();
+        if (!_clients.TryGetValue(pid, out var current))
+        {
+            // A Close from a timed-out client means it is not a recovery target.
+            _recoveryCandidates.Remove(pid);
+            // No active connection, but a late close for a timeout-evicted HWND
+            // must not be charged to a future connection of the same PID.
+            if (_pendingCloseAfterEviction.TryGetValue(pid, out var pending))
+            {
+                if (pending <= 1) _pendingCloseAfterEviction.Remove(pid);
+                else _pendingCloseAfterEviction[pid] = pending - 1;
+            }
+            return;
+        }
+
+        // A dead current HWND can never recover: do not let missing older
+        // close messages keep its PID entry artificially alive.
+        if (!IsWindow(current.RemoteWindow))
+        {
+            _recoveryCandidates.Remove(pid);
+            _clients.Remove(pid);
+            Notify($"Game-Hook Client-Fenster geschlossen (PID {pid}).");
+            return;
+        }
+
+        if (current.SupersededCloseCount > 0)
+        {
+            // PID-only legacy close: consume a superseded connection's close
+            // before removing the newer HWND. No sender identity is available.
+            current.SupersededCloseCount--;
+            _clients[pid] = current;
+            return;
+        }
+
         if (_clients.Remove(pid))
         {
+            _recoveryCandidates.Remove(pid);
             Notify($"Game-Hook Client getrennt (PID {pid}).");
         }
     }
@@ -493,9 +655,20 @@ internal sealed class GameHookOverlayRuntime : IDisposable
                 if (_clients.TryGetValue(senderPid, out var client))
                 {
                     client.OverlayInitialized = true;
+                    // Older IPC peers without the capability must NOT receive newer
+                    // messages. Only a candidate explicitly advertising this
+                    // optional capability may receive replay on re-init.
+                    client.SupportsInputStateReplay = HasInputStateReplay(msgJson);
+                    client.SupportsAuxiliarySurface =
+                        HasClientCapability(msgJson, "experimentalAuxiliarySurface");
+                    client.SupportsAuxiliaryInput =
+                        client.SupportsAuxiliarySurface &&
+                        HasClientCapability(msgJson, "experimentalAuxiliaryInput");
+                    client.SupportsNativeMainInput =
+                        HasClientCapability(msgJson, "experimentalMainInput");
                     _clients[senderPid] = client;
-                    SendOverlayInit(client);
-                    Notify($"Game-Prozess meldet sich (PID {senderPid}). Overlay init gesendet.");
+                    if (SendOverlayInit(client))
+                        Notify($"Game-Prozess meldet sich (PID {senderPid}). Overlay init gesendet.");
                 }
                 break;
             case "graphics.window":
@@ -510,43 +683,123 @@ internal sealed class GameHookOverlayRuntime : IDisposable
                 Notify($"game.input.intercept: {msgJson}");
                 break;
             case "game.input":
-                if (_forwardGameInputToWindow)
-                {
+                if ((_forwardNativeMainInput || IsNativeInputCancel(msgJson)) &&
+                    _clients.TryGetValue(senderPid, out var mainClient) &&
+                    mainClient.OverlayInitialized && mainClient.SupportsNativeMainInput)
                     ForwardGameInput(msgJson);
-                }
                 break;
+            case "experimental.aux.input":
+                // New protocol: only this exact registered PID may submit
+                // opt-in input to the separately hosted WPF sphere. Legacy
+                // Peers lacking the capability do not advertise support.
+                if (_clients.TryGetValue(senderPid, out var auxClient) &&
+                    auxClient.OverlayInitialized && auxClient.SupportsAuxiliaryInput &&
+                    (_forwardGameInputToWindow || IsNativeInputCancel(msgJson)))
+                    ForwardAuxiliaryInput(msgJson);
+                break;
+        }
+    }
+
+    private static bool IsNativeInputCancel(string msgJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(msgJson);
+            return doc.RootElement.TryGetProperty("msg", out var msg) &&
+                   msg.TryGetUInt32(out var code) && code == 0x001F;
+        }
+        catch (JsonException) { return false; }
+        catch (InvalidOperationException) { return false; }
+    }
+
+    private static bool HasClientCapability(string msgJson, string name)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(msgJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty(name, out var flag) &&
+                flag.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException) { return false; }
+    }
+
+    private static bool HasInputStateReplay(string msgJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(msgJson);
+            return document.RootElement.ValueKind == JsonValueKind.Object &&
+                document.RootElement.TryGetProperty("inputStateReplay", out var flag) &&
+                flag.ValueKind == JsonValueKind.True;
+        }
+        catch (JsonException)
+        {
+            return false;
         }
     }
 
     private void ForwardGameInput(string msgJson)
     {
+        if (!_overlayWindow.IsVisible ||
+            _overlayWindow.WindowState == WindowState.Minimized) return;
         try
         {
             using var doc = JsonDocument.Parse(msgJson);
             var root = doc.RootElement;
-            var windowId = root.TryGetProperty("windowId", out var winIdEl) ? winIdEl.GetUInt32() : 0;
-            if (windowId != _overlayWindowId)
+            if (root.ValueKind != JsonValueKind.Object ||
+                !root.TryGetProperty("windowId", out var id) ||
+                !id.TryGetUInt32(out var expected) || expected != _overlayWindowId ||
+                !root.TryGetProperty("msg", out var message) ||
+                !message.TryGetUInt32(out var msg) ||
+                (msg != 0x0200 && msg != 0x0201 &&
+                 msg != 0x0202 && msg != 0x02A3 && msg != 0x001F) ||
+                !root.TryGetProperty("wparam", out var wpEl) ||
+                !wpEl.TryGetUInt32(out var wp) || wp > 1 ||
+                !root.TryGetProperty("lparam", out var lpEl) ||
+                !lpEl.TryGetUInt32(out var lp))return;
+            if (msg == 0x001F && (wp != 0 || lp != 0)) return;
+            if (msg != 0x02A3 && msg != 0x001F)
             {
-                return;
+                var x = (int)(lp & 0xFFFF);
+                var y = (int)((lp >> 16) & 0xFFFF);
+                var dpi = VisualTreeHelper.GetDpi(_overlayWindow);
+                if (x >= _overlayWindow.ActualWidth * dpi.DpiScaleX ||
+                    y >= _overlayWindow.ActualHeight * dpi.DpiScaleY)
+                    return;
             }
-
-            var msg = root.TryGetProperty("msg", out var msgEl) ? msgEl.GetUInt32() : 0;
-            var wparam = root.TryGetProperty("wparam", out var wpEl) ? wpEl.GetUInt32() : 0;
-            var lparam = root.TryGetProperty("lparam", out var lpEl) ? lpEl.GetUInt32() : 0;
-
             var hwnd = new WindowInteropHelper(_overlayWindow).Handle;
-            if (hwnd != IntPtr.Zero)
-            {
-                _ = PostMessage(hwnd, unchecked((int)msg), new IntPtr((int)wparam), new IntPtr((int)lparam));
-            }
+            if (hwnd != IntPtr.Zero &&
+                unchecked((uint)(ulong)hwnd.ToInt64()) == expected)
+                _ = PostMessage(hwnd, unchecked((int)msg), new IntPtr((int)wp),
+                    new IntPtr(unchecked((int)lp)));
         }
-        catch
+        catch (Exception e) when (e is JsonException or FormatException
+                                    or OverflowException or InvalidOperationException)
         {
-            // ignore malformed input events
+            // Never forward arbitrary or malformed WM_* from the game.
         }
     }
 
-    private void SendOverlayInit(RemoteClient client)
+    private void PublishMainInputPolicy(RemoteClient? target = null)
+    {
+        var json = JsonSerializer.Serialize(new
+        {
+            type = "experimental.main.input.policy",
+            enabled = _forwardNativeMainInput
+        }, _jsonOptions);
+        if (target.HasValue)
+        {
+            if (target.Value.SupportsNativeMainInput)
+                SendOverlayMessage(target.Value, "experimental.main.input.policy", json);
+            return;
+        }
+        foreach (var client in new List<RemoteClient>(_clients.Values))
+            if (client.OverlayInitialized && client.SupportsNativeMainInput)
+                SendOverlayMessage(client, "experimental.main.input.policy", json);
+    }
+
+    private bool SendOverlayInit(RemoteClient client)
     {
         var rect = GetOverlayWindowRect();
         var display = SystemParameters.WorkArea;
@@ -598,22 +851,43 @@ internal sealed class GameHookOverlayRuntime : IDisposable
             dragMode = 1
         };
 
-        SendOverlayMessage(client, "overlay.init", JsonSerializer.Serialize(payload, _jsonOptions));
+        if (!SendOverlayMessage(client, "overlay.init",
+                JsonSerializer.Serialize(payload, _jsonOptions)))
+            return false;
+
+        // The baseline WPF IPC protocol is retained for capability-limited peers.
+        // Only opt-in candidates can request input state replay on recovery.
+        // A separately hosted WPF sphere is published only to clients
+        // explicitly advertising the optional auxiliary-surface contract.
+        if (client.SupportsAuxiliarySurface)
+            SendAuxiliaryBoundsIfChanged(force: true, recipient: client);
+        if (client.SupportsAuxiliaryInput)
+            PublishAuxiliaryInputPolicy(client);
+        if (client.SupportsNativeMainInput)
+            PublishMainInputPolicy(client);
+
+        if (!client.SupportsInputStateReplay) return true;
+        var inputState = new { type = "command.input.intercept", intercept = _inputInterceptEnabled };
+        return SendOverlayMessage(client, "command.input.intercept",
+            JsonSerializer.Serialize(inputState, _jsonOptions));
     }
 
     private void BroadcastOverlayMessage(string type, string jsonPayload)
     {
-        foreach (var client in _clients.Values)
+        // Make a snapshot: a timed-out client is removed, but must never
+        // invalidate iteration or prevent healthy clients from receiving.
+        foreach (var client in new List<RemoteClient>(_clients.Values))
         {
             SendOverlayMessage(client, type, jsonPayload);
         }
     }
 
-    private void SendOverlayMessage(RemoteClient client, string type, string jsonPayload)
+    private bool SendOverlayMessage(RemoteClient client, string type, string jsonPayload)
     {
         if (client.RemoteWindow == IntPtr.Zero)
         {
-            return;
+            DropUnresponsiveClient(client);
+            return false;
         }
 
         var overlayBody = PackOverlayIpc(type, jsonPayload);
@@ -623,7 +897,70 @@ internal sealed class GameHookOverlayRuntime : IDisposable
         WriteInt(packet, 8, 0);
         Buffer.BlockCopy(overlayBody, 0, packet, 12, overlayBody.Length);
 
-        SendCopyData(client.RemoteWindow, packet);
+        if (SendCopyData(client.RemoteWindow, packet)) return true;
+        DropUnresponsiveClient(client);
+        return false;
+    }
+
+    private void DropUnresponsiveClient(RemoteClient client)
+    {
+        // A newer connection for the same PID must never be evicted due to
+        // the prior HWND's timeout.
+        if (_clients.TryGetValue(client.ProcessId, out var current) &&
+            current.RemoteWindow == client.RemoteWindow)
+        {
+            // The eviction does not cancel a legacy PID-only close already
+            // queued by this HWND or by a predecessor it superseded.
+            var debt = current.SupersededCloseCount;
+            if (debt < int.MaxValue) debt++;
+            _pendingCloseAfterEviction[client.ProcessId] = debt;
+            _clients.Remove(client.ProcessId);
+            var now = Environment.TickCount64;
+            _recoveryCandidates[client.ProcessId] = new RecoveryCandidate
+            {
+                Client = current,
+                NextAttemptAtMs = now + RecoveryRetryMs,
+                ExpiresAtMs = now + RecoveryWindowMs
+            };
+            Notify($"Game-Hook Client antwortet nicht (PID {client.ProcessId}); Wiederherstellung wird bis zu 30 s versucht.");
+        }
+    }
+
+    // Existing 33-ms frame tick is also the recovery scheduler. Only one
+    // bounded IPC probe per candidate/second; no volume, input or injection.
+    private void RecoverResponsiveClients()
+    {
+        if (_recoveryCandidates.Count == 0) return;
+        var now = Environment.TickCount64;
+        foreach (var (pid, recovery) in new List<KeyValuePair<uint, RecoveryCandidate>>(_recoveryCandidates))
+        {
+            if (_clients.ContainsKey(pid))
+            {
+                _recoveryCandidates.Remove(pid);
+                continue;
+            }
+
+            _ = GetWindowThreadProcessId(recovery.Client.RemoteWindow, out var windowPid);
+            if (now >= recovery.ExpiresAtMs || !IsWindow(recovery.Client.RemoteWindow) ||
+                windowPid != pid)
+            {
+                _recoveryCandidates.Remove(pid);
+                _pendingCloseAfterEviction.Remove(pid);
+                continue;
+            }
+
+            if (now < recovery.NextAttemptAtMs) continue;
+            recovery.NextAttemptAtMs = now + RecoveryRetryMs;
+
+            // Sending overlay.init to an already-connected native IPC link is
+            // understood by the legacy protocol and refreshes the shared map.
+            // A failed probe leaves the candidate quarantined and rate-limited.
+            if (!SendOverlayInit(recovery.Client)) continue;
+            _recoveryCandidates.Remove(pid);
+            _pendingCloseAfterEviction.Remove(pid);
+            _clients[pid] = recovery.Client;
+            Notify($"Game-Hook Client wieder erreichbar (PID {pid}).");
+        }
     }
 
     private byte[] PackOverlayIpc(string type, string jsonPayload)
@@ -635,7 +972,7 @@ internal sealed class GameHookOverlayRuntime : IDisposable
         return bytes.ToArray();
     }
 
-    private void SendCopyData(IntPtr remoteWindow, byte[] payload)
+    private bool SendCopyData(IntPtr remoteWindow, byte[] payload)
     {
         var ptr = Marshal.AllocHGlobal(payload.Length);
         try
@@ -647,7 +984,11 @@ internal sealed class GameHookOverlayRuntime : IDisposable
                 CbData = payload.Length,
                 LpData = ptr
             };
-            _ = SendMessage(remoteWindow, WmCopyData, IntPtr.Zero, ref cds);
+            // SMTO_BLOCK prevents reentrant calls while waiting. The return
+            // value indicates delivery, independently of receiver's LRESULT.
+            return SendMessageTimeout(remoteWindow, WmCopyData, IntPtr.Zero,
+                ref cds, SmtoAbortIfHung | SmtoBlock, IpcSendTimeoutMs,
+                out _) != IntPtr.Zero;
         }
         finally
         {
@@ -730,11 +1071,23 @@ internal sealed class GameHookOverlayRuntime : IDisposable
         public IntPtr LpData;
     }
 
+    private sealed class RecoveryCandidate
+    {
+        public RemoteClient Client;
+        public long NextAttemptAtMs;
+        public long ExpiresAtMs;
+    }
+
     private struct RemoteClient
     {
         public uint ProcessId;
         public IntPtr RemoteWindow;
         public bool OverlayInitialized;
+        public bool SupportsInputStateReplay;
+        public bool SupportsAuxiliarySurface;
+        public bool SupportsAuxiliaryInput;
+        public bool SupportsNativeMainInput;
+        public int SupersededCloseCount;
     }
 
     private delegate IntPtr WndProcDelegate(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
@@ -776,14 +1129,19 @@ internal sealed class GameHookOverlayRuntime : IDisposable
             : SetWindowLongPtr32(hWnd, nIndex, dwNewLong);
     }
 
-    [DllImport("user32.dll", SetLastError = true)]
-    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref CopyDataStruct lParam);
+    [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", SetLastError = true)]
+    private static extern IntPtr SendMessageTimeout(IntPtr hWnd, int msg,
+        IntPtr wParam, ref CopyDataStruct lParam, uint flags, uint timeoutMs,
+        out IntPtr result);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool PostMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
 
     [DllImport("kernel32.dll")]
     private static extern uint GetCurrentProcessId();

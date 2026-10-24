@@ -1,4 +1,4 @@
-namespace MiniMixerOverlay.Core;
+﻿namespace MiniMixerOverlay.Core;
 
 using System;
 using System.Collections.Generic;
@@ -20,559 +20,439 @@ public class GuardEngine : IGuardEngine
 {
     private readonly IRuleStore _ruleStore;
     private readonly ISessionClassifier _classifier;
-    private float _autoVolume = GuardDefaults.AutoVolumePercent / 100f;
+    private float _autoVolume = 0.05f;
     private bool _autoApplyToAllNewApps = true;
-    private readonly Dictionary<string, (DateTime CheckedUtc, DateTime PresenceSignalUtc, string Source)> _presenceSignalCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, (DateTime CheckedUtc, Dictionary<string, DateTime> PresenceSignalsUtcByDir)> _steamPresenceSignalCache = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly TimeSpan PresenceSignalCacheTtl = TimeSpan.FromMinutes(8);
-    private static readonly TimeSpan MissingPresenceSignalRetryTtl = TimeSpan.FromSeconds(5);
-    private static readonly TimeSpan SteamPresenceSignalCacheTtl = TimeSpan.FromMinutes(10);
+    private int _autoLimitMaxInstallAgeDays = 7;
+    private readonly Dictionary<string, (DateTime CheckedUtc, DateTime InstallSignalUtc, string Source)> _installSignalCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, (DateTime CheckedUtc, Dictionary<string, DateTime> InstallSignalsUtcByDir)> _steamInstallSignalCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly TimeSpan InstallSignalCacheTtl = TimeSpan.FromMinutes(8);
+    private static readonly TimeSpan SteamInstallSignalCacheTtl = TimeSpan.FromMinutes(10);
     private const int ProcessQueryLimitedInformation = 0x1000;
 
     public GuardEngine(
         IRuleStore ruleStore,
         ISessionClassifier classifier,
-        int autoVolumePercent = GuardDefaults.AutoVolumePercent,
-        bool autoApplyToAllNewApps = true)
+        int autoVolumePercent = 5,
+        bool autoApplyToAllNewApps = true,
+        int autoLimitMaxInstallAgeDays = 7)
     {
         _ruleStore = ruleStore;
         _classifier = classifier;
-        Configure(autoVolumePercent, autoApplyToAllNewApps);
+        Configure(autoVolumePercent, autoApplyToAllNewApps, autoLimitMaxInstallAgeDays);
     }
 
-    public void Configure(int autoVolumePercent, bool autoApplyToAllNewApps)
+    public void Configure(int autoVolumePercent, bool autoApplyToAllNewApps, int autoLimitMaxInstallAgeDays)
     {
         _autoVolume = Math.Clamp(autoVolumePercent, 1, 100) / 100f;
         _autoApplyToAllNewApps = autoApplyToAllNewApps;
+        _autoLimitMaxInstallAgeDays = Math.Clamp(autoLimitMaxInstallAgeDays, 1, 365);
     }
 
     public bool ShouldAutoApplyVolume(AppRule rule, DateTime toolFirstRunUtc)
     {
-        if (rule.BaselineAtFirstRun) return false;
-        if (rule.DiscoveryStatus != AppDiscoveryStatus.NewEligible) return false;
+        if (rule.ManualOverride) return false;
+        if (rule.AutoApplied) return false;
         if (!_autoApplyToAllNewApps && rule.Classification != AppClassification.Game) return false;
+        if (rule.FirstSeenUtc <= toolFirstRunUtc) return false;
+
         return true;
     }
 
-    public GuardDecision EvaluateNewSession(
-        string appIdentityKey,
-        string exePath,
-        string displayName,
-        float currentVolume,
-        string outputDeviceId,
-        string outputDeviceName,
-        bool isBaselineScan = false,
-        IReadOnlyCollection<uint>? processIds = null)
+    public GuardDecision EvaluateNewSession(string exePath, string displayName, float currentVolume, bool isBaselineScan = false, IReadOnlyCollection<uint>? processIds = null)
     {
-        var nowUtc = DateTime.UtcNow;
-        var effectiveExePath = ResolveEffectiveExePath(exePath, processIds);
-        var identityKey = string.IsNullOrWhiteSpace(appIdentityKey)
-            ? AppIdentity.CreateKey(effectiveExePath, Path.GetFileName(effectiveExePath), displayName)
-            : appIdentityKey;
-        var deviceId = OutputDeviceIdentity.Normalize(outputDeviceId);
-
         var decision = new GuardDecision
         {
-            AppIdentityKey = identityKey,
             DisplayName = displayName ?? string.Empty,
             InputExePath = exePath ?? string.Empty,
-            EffectiveExePath = effectiveExePath,
-            IsBaselineScan = isBaselineScan,
-            OutputDeviceId = deviceId,
-            OutputDeviceName = outputDeviceName ?? string.Empty
+            IsBaselineScan = isBaselineScan
         };
+        var nowUtc = DateTime.UtcNow;
 
-        if (string.IsNullOrWhiteSpace(identityKey))
+        if (string.IsNullOrWhiteSpace(exePath))
         {
-            decision.Reason = "Keine stabile App-Identitaet verfuegbar - keine Guard-Pruefung moeglich";
+            decision.Reason = "Kein EXE-Pfad verfuegbar - keine Guard-Pruefung moeglich";
             return decision;
+        }
+
+        var effectiveExePath = ResolveEffectiveExePath(exePath, processIds);
+        decision.EffectiveExePath = effectiveExePath;
+        var existingRule = _ruleStore.GetRule(exePath);
+        if (existingRule == null && !string.Equals(effectiveExePath, exePath, StringComparison.OrdinalIgnoreCase))
+        {
+            existingRule = _ruleStore.GetRule(effectiveExePath);
+        }
+        else if (existingRule != null &&
+                 !string.IsNullOrWhiteSpace(effectiveExePath) &&
+                 !string.Equals(effectiveExePath, exePath, StringComparison.OrdinalIgnoreCase) &&
+                 _ruleStore.GetRule(effectiveExePath) == null)
+        {
+            _ruleStore.UpsertRule(effectiveExePath, existingRule);
         }
 
         var classification = _classifier.Classify(effectiveExePath, displayName ?? string.Empty);
         decision.Classification = classification;
+        decision.ExistingRuleFound = existingRule != null;
 
-        var rule = _ruleStore.ResolveRule(
-            identityKey,
-            effectiveExePath,
-            Path.GetFileName(effectiveExePath),
-            displayName ?? string.Empty);
-
-        var ruleAlreadyExisted = rule != null;
-        decision.ExistingRuleFound = ruleAlreadyExisted;
-
-        if (rule == null)
+        if (existingRule != null)
         {
-            rule = new AppRule
-            {
-                AppIdentityKey = identityKey,
-                LastKnownExePath = effectiveExePath,
-                BaselineAtFirstRun = isBaselineScan,
-                DisplayName = displayName ?? string.Empty,
-                ExeName = Path.GetFileName(effectiveExePath),
-                Classification = classification,
-                FirstSeenUtc = isBaselineScan ? _ruleStore.ToolFirstRunUtc : nowUtc,
-                LastSeenUtc = nowUtc,
-                DiscoveryStatus = isBaselineScan ? AppDiscoveryStatus.Baseline : AppDiscoveryStatus.Unknown,
-                AutoApplied = false,
-                AutoVolume = _autoVolume,
-                ManualOverride = false,
-                Locked = false,
-                Favorite = false,
-                LastKnownVolume = currentVolume
-            };
-        }
-        else
-        {
-            rule.AppIdentityKey = identityKey;
-            rule.LastKnownExePath = effectiveExePath;
-            rule.LastSeenUtc = nowUtc;
-            rule.DeviceProfiles ??= new Dictionary<string, DeviceVolumeProfile>(StringComparer.OrdinalIgnoreCase);
+            decision.RuleAutoApplied = existingRule.AutoApplied;
+            decision.RuleManualOverride = existingRule.ManualOverride;
 
-            if (string.IsNullOrWhiteSpace(rule.ExeName))
+            if (!string.IsNullOrWhiteSpace(exePath) &&
+                !string.Equals(exePath, effectiveExePath, StringComparison.OrdinalIgnoreCase) &&
+                _ruleStore.GetRule(exePath) == null)
             {
-                rule.ExeName = Path.GetFileName(effectiveExePath);
+                _ruleStore.UpsertRule(exePath, existingRule);
             }
 
-            if (string.IsNullOrWhiteSpace(rule.DisplayName))
+            existingRule.LastSeenUtc = nowUtc;
+
+            // Classification nur in Richtung "Game" nachschaerfen.
+            if (existingRule.Classification != AppClassification.Game && classification == AppClassification.Game)
             {
-                rule.DisplayName = displayName ?? string.Empty;
+                existingRule.Classification = AppClassification.Game;
+                decision.Classification = AppClassification.Game;
             }
 
-            // Classification is only strengthened towards Game.
-            if (rule.Classification != AppClassification.Game && classification == AppClassification.Game)
+            if (isBaselineScan)
             {
-                rule.Classification = AppClassification.Game;
+                decision.Reason = $"Baseline-Erfassung fuer {displayName} - keine Automatik";
+                return decision;
             }
 
-            if (rule.BaselineAtFirstRun)
+            // FirstSeenUtc is immutable: a subsequent refresh cannot turn a baseline app into a new app.
+
+            if (ShouldAutoApplyVolume(existingRule, _ruleStore.ToolFirstRunUtc))
             {
-                rule.DiscoveryStatus = AppDiscoveryStatus.Baseline;
-            }
-            else if (rule.DiscoveryStatus == AppDiscoveryStatus.Unknown && rule.AutoApplied)
-            {
-                // A legacy AutoApplied rule necessarily passed the old install-newness guard.
-                rule.DiscoveryStatus = AppDiscoveryStatus.NewEligible;
-            }
-        }
+                if (IsAutoLimitAgeEligible(effectiveExePath, out var installAgeDays, out var installSignalSource, out var installSignalUtc))
+                {
+                    decision.InstallAgeDays = installAgeDays;
+                    decision.InstallSignalSource = installSignalSource;
+                    decision.InstallSignalUtc = installSignalUtc;
+                    decision.AutoApplyAllowed = true;
+                    decision.TargetVolume = _autoVolume;
+                    decision.Reason = $"Neue App erkannt - Auto-Apply auf {_autoVolume * 100:F0}%";
+                    return decision;
+                }
 
-        decision.Classification = rule.Classification;
-        rule.DeviceProfiles ??= new Dictionary<string, DeviceVolumeProfile>(StringComparer.OrdinalIgnoreCase);
+                // Fallback: Profil-Alter statt Installationsalter (UWP/Xbox/Epic/GOG).
+                if (IsProfileAgeWithinLimit(existingRule, out var profileAgeDays))
+                {
+                    decision.InstallAgeDays = profileAgeDays;
+                    decision.InstallSignalSource = "profile_age";
+                    decision.InstallSignalUtc = existingRule.FirstSeenUtc;
+                    decision.AutoApplyAllowed = true;
+                    decision.TargetVolume = _autoVolume;
+                    decision.Reason = $"App-Profil {profileAgeDays}d alt - Auto-Apply auf {_autoVolume * 100:F0}%";
+                    return decision;
+                }
 
-        // The initial baseline is a property of the logical application, not of an audio device.
-        if (isBaselineScan && rule.DiscoveryStatus == AppDiscoveryStatus.Unknown)
-        {
-            rule.BaselineAtFirstRun = true;
-            rule.DiscoveryStatus = AppDiscoveryStatus.Baseline;
-        }
-
-        // Resolve application newness once, but keep Unknown retryable. This fixes sessions
-        // whose process/path metadata is incomplete during the first audio callback.
-        if (rule.DiscoveryStatus == AppDiscoveryStatus.Unknown)
-        {
-            ResolveDiscoveryStatus(rule, effectiveExePath, nowUtc, decision);
-        }
-        else
-        {
-            decision.PresenceSignalUtc = rule.InstallSignalUtc;
-            decision.PresenceSignalSource = rule.InstallSignalSource;
-        }
-
-        decision.DiscoveryStatus = rule.DiscoveryStatus;
-
-        var hadAnyDeviceProfiles = rule.DeviceProfiles.Count > 0;
-        var profileExisted = rule.DeviceProfiles.TryGetValue(deviceId, out var profile);
-        decision.DeviceProfileExisted = profileExisted;
-
-        if (profile == null)
-        {
-            profile = new DeviceVolumeProfile
-            {
-                DeviceId = deviceId,
-                DeviceName = outputDeviceName ?? string.Empty,
-                FirstSeenUtc = nowUtc,
-                LastSeenUtc = nowUtc,
-                GuardEvaluated = false,
-                AutoApplied = false,
-                AutoVolume = _autoVolume,
-                ManualOverride = false,
-                LastKnownVolume = currentVolume
-            };
-
-            // Lossless one-time migration from the pre-device-profile model. The old file
-            // cannot tell which endpoint owned its volume, so the first endpoint observed
-            // after upgrade adopts the legacy state. Later endpoints get independent profiles.
-            if (!hadAnyDeviceProfiles && (rule.ManualOverride || rule.AutoApplied))
-            {
-                profile.ManualOverride = rule.ManualOverride;
-                profile.AutoApplied = rule.AutoApplied;
-                profile.GuardEvaluated = true;
-                profile.AutoVolume = rule.AutoVolume > 0f ? rule.AutoVolume : _autoVolume;
-                profile.LastKnownVolume = Math.Clamp(rule.LastKnownVolume, 0f, 1f);
-
-                decision.ApplyVolume = true;
-                decision.ProfileRestore = true;
-                decision.TargetVolume = profile.LastKnownVolume;
-                decision.Reason = $"Legacy-Geraeteprofil fuer {displayName} auf {profile.LastKnownVolume * 100:F0}% uebernommen";
+                decision.InstallAgeDays = installAgeDays ?? profileAgeDays;
+                decision.InstallSignalSource = installSignalSource;
+                decision.InstallSignalUtc = installSignalUtc;
+                decision.Reason = installAgeDays.HasValue
+                    ? $"Installationsalter {installAgeDays.Value}d > {_autoLimitMaxInstallAgeDays}d - keine Automatik"
+                    : $"Profilalter {profileAgeDays}d > {_autoLimitMaxInstallAgeDays}d - keine Automatik";
+                return decision;
             }
 
-            rule.DeviceProfiles[deviceId] = profile;
-        }
-        else
-        {
-            profile.DeviceId = deviceId;
-            if (!string.IsNullOrWhiteSpace(outputDeviceName))
+            // Fallback fuer "frisch installiert, aber in Baseline erfasst":
+            // Wird die EXE/Installationsstruktur erst nach Tool-First-Run erkannt,
+            // erlauben wir genau dann ebenfalls eine einmalige Auto-Anwendung.
+            if (ShouldAutoApplyFromInstallSignal(existingRule, effectiveExePath))
             {
-                profile.DeviceName = outputDeviceName;
+                decision.AutoApplyAllowed = true;
+                decision.TargetVolume = _autoVolume;
+                decision.Reason = $"Neue Installation erkannt - Auto-Apply auf {_autoVolume * 100:F0}%";
+                return decision;
             }
-            profile.LastSeenUtc = nowUtc;
-        }
 
-        decision.RuleAutoApplied = rule.AutoApplied;
-        decision.RuleManualOverride = rule.ManualOverride;
-        decision.DeviceProfileAutoApplied = profile.AutoApplied;
-        decision.DeviceProfileManualOverride = profile.ManualOverride;
-
-        // Manual intent on this endpoint always wins.
-        if (profile.ManualOverride)
-        {
-            profile.GuardEvaluated = true;
-            if (!decision.ApplyVolume)
+            if (existingRule.ManualOverride)
             {
-                decision.Reason = $"Manueller Geraete-Override fuer {displayName} - keine Automatik";
+                decision.Reason = $"Manueller Override fuer {displayName} - keine Automatik";
+                return decision;
             }
-            PersistRule(identityKey, rule);
+
+            if (existingRule.AutoApplied)
+            {
+                decision.Reason = $"Auto-Apply bereits durchgefuehrt fuer {displayName}";
+                return decision;
+            }
+
+            decision.Reason = $"Bekannte Anwendung {displayName} - keine Automatik";
             return decision;
         }
 
-        // Existing endpoint profiles are initialized once. Their remembered volume is restored
-        // by MixerController when a fresh Windows audio session appears.
-        if (profile.GuardEvaluated)
+        // Neue Anwendung - Regel anlegen.
+        var firstSeenUtc = isBaselineScan ? _ruleStore.ToolFirstRunUtc : nowUtc;
+        var newRule = new AppRule
         {
-            if (!decision.ApplyVolume)
+            DisplayName = displayName ?? string.Empty,
+            ExeName = Path.GetFileName(exePath),
+            Classification = classification,
+            FirstSeenUtc = firstSeenUtc,
+            LastSeenUtc = nowUtc,
+            AutoApplied = false,
+            AutoVolume = _autoVolume,
+            ManualOverride = false,
+            Locked = false,
+            Favorite = false,
+            LastKnownVolume = currentVolume
+        };
+
+        _ruleStore.UpsertRule(effectiveExePath, newRule);
+        if (!string.IsNullOrWhiteSpace(exePath) &&
+            !string.Equals(exePath, effectiveExePath, StringComparison.OrdinalIgnoreCase))
+        {
+            _ruleStore.UpsertRule(exePath, newRule);
+        }
+
+        if (isBaselineScan)
+        {
+            if (ShouldAutoApplyFromInstallSignal(newRule, effectiveExePath))
             {
-                decision.Reason = profile.AutoApplied
-                    ? $"Geraeteprofil fuer {displayName} bereits initialisiert"
-                    : $"Bekanntes Geraeteprofil fuer {displayName}";
+                decision.AutoApplyAllowed = true;
+                decision.TargetVolume = _autoVolume;
+                decision.Reason = $"Neue Installation erkannt - Auto-Apply auf {_autoVolume * 100:F0}%";
+                return decision;
             }
-            PersistRule(identityKey, rule);
+
+            decision.Reason = $"Baseline-Erfassung fuer {displayName} - keine Automatik";
             return decision;
         }
 
-        if (rule.DiscoveryStatus == AppDiscoveryStatus.Unknown)
+        if (ShouldAutoApplyVolume(newRule, _ruleStore.ToolFirstRunUtc))
         {
-            // Important: do NOT finalize this profile. A later refresh may have a real exe path
-            // or install signal and should get another chance to apply the new-app limit.
-            decision.Reason = $"Praesenzstatus fuer {displayName} noch ungeklaert - Guard wird erneut pruefen";
-            PersistRule(identityKey, rule);
-            return decision;
-        }
-
-        if (rule.DiscoveryStatus is AppDiscoveryStatus.Baseline or AppDiscoveryStatus.PresentBeforeFirstRun)
-        {
-            profile.GuardEvaluated = true;
-            profile.LastKnownVolume = currentVolume;
-            decision.Reason = rule.DiscoveryStatus switch
+            if (IsAutoLimitAgeEligible(effectiveExePath, out var installAgeDays, out var installSignalSource, out var installSignalUtc))
             {
-                AppDiscoveryStatus.Baseline => $"Baseline-Anwendung {displayName} - keine Automatik",
-                _ => $"Bereits vor dem ersten MiniMixer-Start vorhanden - keine Automatik fuer {displayName}"
-            };
-            PersistRule(identityKey, rule);
+                decision.InstallAgeDays = installAgeDays;
+                decision.InstallSignalSource = installSignalSource;
+                decision.InstallSignalUtc = installSignalUtc;
+                decision.AutoApplyAllowed = true;
+                decision.TargetVolume = _autoVolume;
+                decision.Reason = $"Neue App erkannt - Auto-Apply auf {_autoVolume * 100:F0}%";
+                return decision;
+            }
+
+            // Fallback: Profil-Alter statt Installationsdatum (UWP/Xbox/Epic/GOG).
+            // Das Profil schuetzt vor Falscherkennung nach Updates:
+            // alte Programme behalten ihr urspruengliches FirstSeenUtc.
+            if (IsProfileAgeWithinLimit(newRule, out var profileAgeDays))
+            {
+                decision.InstallAgeDays = profileAgeDays;
+                decision.InstallSignalSource = "profile_age";
+                decision.InstallSignalUtc = newRule.FirstSeenUtc;
+                decision.AutoApplyAllowed = true;
+                decision.TargetVolume = _autoVolume;
+                decision.Reason = $"App-Profil {profileAgeDays}d alt - Auto-Apply auf {_autoVolume * 100:F0}%";
+                return decision;
+            }
+
+            decision.InstallAgeDays = installAgeDays ?? profileAgeDays;
+            decision.InstallSignalSource = installSignalSource;
+            decision.InstallSignalUtc = installSignalUtc;
+            decision.Reason = installAgeDays.HasValue
+                ? $"Installationsalter {installAgeDays.Value}d > {_autoLimitMaxInstallAgeDays}d - keine Automatik"
+                : $"Profilalter {profileAgeDays}d > {_autoLimitMaxInstallAgeDays}d - keine Automatik";
             return decision;
+        }
+
+        decision.Reason = $"Neue Nicht-Spiel-Anwendung {displayName} - keine Automatik";
+        return decision;
+    }
+
+    private bool ShouldAutoApplyFromInstallSignal(AppRule rule, string exePath)
+    {
+        if (rule.ManualOverride || rule.AutoApplied)
+        {
+            return false;
         }
 
         if (!_autoApplyToAllNewApps && rule.Classification != AppClassification.Game)
         {
-            profile.GuardEvaluated = true;
-            profile.LastKnownVolume = currentVolume;
-            decision.Reason = $"Neue Nicht-Spiel-Anwendung {displayName} - keine Automatik";
-            PersistRule(identityKey, rule);
-            return decision;
+            return false;
         }
 
-        // NewEligible is global to the logical application, while AutoApplied is per device.
-        // Every output endpoint gets its own one-time initialization and then keeps its own value.
-        profile.GuardEvaluated = true;
-        profile.AutoApplied = true;
-        profile.AutoVolume = _autoVolume;
-        profile.LastKnownVolume = _autoVolume;
+        // Nur fuer Regeln, die initial auf Tool-First-Run standen (Baseline-Fall).
+        if (rule.FirstSeenUtc > _ruleStore.ToolFirstRunUtc.AddSeconds(2))
+        {
+            return false;
+        }
 
-        rule.AutoApplied = true; // legacy compatibility / status display only
-        rule.AutoVolume = _autoVolume;
-        rule.LastKnownVolume = _autoVolume;
-
-        decision.AutoApplyAllowed = true;
-        decision.ApplyVolume = true;
-        decision.TargetVolume = _autoVolume;
-        decision.DeviceProfileAutoApplied = true;
-        decision.Reason = $"Neue App auf neuem Ausgabegeraet erkannt - Auto-Apply auf {_autoVolume * 100:F0}%";
-        PersistRule(identityKey, rule);
-        return decision;
+        return IsLikelyInstalledAfterFirstRun(exePath, _ruleStore.ToolFirstRunUtc) &&
+               IsAutoLimitAgeEligible(exePath, out _);
     }
 
-    private void ResolveDiscoveryStatus(AppRule rule, string effectiveExePath, DateTime nowUtc, GuardDecision decision)
+    private bool IsLikelyInstalledAfterFirstRun(string exePath, DateTime toolFirstRunUtc)
     {
-        if (rule.BaselineAtFirstRun)
+        if (!TryGetInstallSignalUtc(exePath, out var installSignalUtc))
         {
-            rule.DiscoveryStatus = AppDiscoveryStatus.Baseline;
-            return;
+            return false;
         }
 
-        if (!TryGetPresenceSignalUtc(effectiveExePath, rule.DisplayName, out var presenceSignalUtc, out var presenceSignalSource))
-        {
-            // Keep Unknown. Persisting the rule is fine; Unknown is intentionally retryable.
-            return;
-        }
-
-        var presenceAgeDays = (int)Math.Floor((nowUtc - presenceSignalUtc).TotalDays);
-        if (presenceAgeDays < 0) presenceAgeDays = 0;
-
-        // Legacy property names are intentionally retained in AppRule for rules.json compatibility.
-        // From v11 onward they hold the earliest reliable local presence/arrival evidence.
-        rule.InstallSignalUtc = presenceSignalUtc;
-        rule.InstallSignalSource = presenceSignalSource;
-        decision.PresenceAgeDays = presenceAgeDays;
-        decision.PresenceSignalSource = presenceSignalSource;
-        decision.PresenceSignalUtc = presenceSignalUtc;
-
-        if (presenceSignalUtc <= _ruleStore.ToolFirstRunUtc.AddMinutes(2))
-        {
-            rule.DiscoveryStatus = AppDiscoveryStatus.PresentBeforeFirstRun;
-            return;
-        }
-
-        // No arbitrary age window. "New" means the earliest reliable evidence says the
-        // application appeared on this Windows installation after MiniMixer's first run.
-        // This works for normal installers, Steam and portable/ZIP applications alike.
-        rule.DiscoveryStatus = AppDiscoveryStatus.NewEligible;
-    }
-
-    private void PersistRule(string identityKey, AppRule rule)
-    {
-        rule.LastSeenUtc = DateTime.UtcNow;
-        _ruleStore.UpsertRule(identityKey, rule);
+        return installSignalUtc > toolFirstRunUtc.AddMinutes(2);
     }
 
     /// <summary>
-    /// Returns the earliest credible evidence that the application was present on this Windows
-    /// installation. This deliberately models presence/arrival, not "installer execution".
-    /// The earliest evidence wins so an updater cannot make an older application look new.
+    /// Prueft, ob das Profil-Alter innerhalb des Auto-Limits liegt.
+    /// Dient als Fallback, wenn kein Installationssignal verfuegbar ist
+    /// (UWP/Xbox/Epic/GOG). Das Profil (FirstSeenUtc) schuetzt vor
+    /// falscher Erkennung nach Updates: alte Programme behalten ihr
+    /// urspruengliches FirstSeenUtc und werden nicht erneut angepasst.
     /// </summary>
-    private bool TryGetPresenceSignalUtc(string exePath, string displayNameHint, out DateTime presenceSignalUtc, out string presenceSignalSource)
+    private bool IsProfileAgeWithinLimit(AppRule rule, out int profileAgeDays)
     {
-        presenceSignalUtc = DateTime.MinValue;
-        presenceSignalSource = string.Empty;
+        profileAgeDays = (int)Math.Floor((DateTime.UtcNow - rule.FirstSeenUtc).TotalDays);
+        if (profileAgeDays < 0) profileAgeDays = 0;
+
+        return profileAgeDays <= _autoLimitMaxInstallAgeDays;
+    }
+
+    private bool IsAutoLimitAgeEligible(string exePath, out int? installAgeDays)
+    {
+        return IsAutoLimitAgeEligible(exePath, out installAgeDays, out _, out _);
+    }
+
+    private bool IsAutoLimitAgeEligible(
+        string exePath,
+        out int? installAgeDays,
+        out string installSignalSource,
+        out DateTime? installSignalUtcValue)
+    {
+        installAgeDays = null;
+        installSignalSource = string.Empty;
+        installSignalUtcValue = null;
+        if (!TryGetInstallSignalUtc(exePath, out var installSignalUtc, out installSignalSource))
+        {
+            return false;
+        }
+
+        installSignalUtcValue = installSignalUtc;
+        installAgeDays = (int)Math.Floor((DateTime.UtcNow - installSignalUtc).TotalDays);
+        if (installAgeDays.Value < 0)
+        {
+            installAgeDays = 0;
+        }
+
+        return installAgeDays.Value <= _autoLimitMaxInstallAgeDays;
+    }
+
+    private bool TryGetInstallSignalUtc(string exePath, out DateTime installSignalUtc)
+    {
+        return TryGetInstallSignalUtc(exePath, out installSignalUtc, out _);
+    }
+
+    private bool TryGetInstallSignalUtc(string exePath, out DateTime installSignalUtc, out string installSignalSource)
+    {
+        installSignalUtc = DateTime.MinValue;
+        installSignalSource = string.Empty;
         if (string.IsNullOrWhiteSpace(exePath))
         {
             return false;
         }
 
         var nowUtc = DateTime.UtcNow;
-        var cacheKey = $"{exePath}\u001f{NormalizeTextKey(displayNameHint)}";
-        if (_presenceSignalCache.TryGetValue(cacheKey, out var cached))
+        if (_installSignalCache.TryGetValue(exePath, out var cached) &&
+            (nowUtc - cached.CheckedUtc) <= InstallSignalCacheTtl)
         {
-            var age = nowUtc - cached.CheckedUtc;
-            if (cached.PresenceSignalUtc != DateTime.MinValue && age <= PresenceSignalCacheTtl)
-            {
-                presenceSignalUtc = cached.PresenceSignalUtc;
-                presenceSignalSource = cached.Source;
-                return true;
-            }
-
-            if (cached.PresenceSignalUtc == DateTime.MinValue && age <= MissingPresenceSignalRetryTtl)
-            {
-                return false;
-            }
+            installSignalUtc = cached.InstallSignalUtc;
+            installSignalSource = cached.Source;
+            return installSignalUtc != DateTime.MinValue;
         }
 
-        var rootedPath = Path.IsPathRooted(exePath) && File.Exists(exePath)
-            ? exePath
-            : string.Empty;
+        DateTime signalUtc = DateTime.MinValue;
+        var signalSource = string.Empty;
 
-        var candidates = new List<(DateTime Utc, string Source)>();
-
-        static void AddCandidate(List<(DateTime Utc, string Source)> list, DateTime utc, string source, DateTime now)
+        var rootedPath = string.Empty;
+        if (Path.IsPathRooted(exePath) && File.Exists(exePath))
         {
-            // Ignore invalid/sentinel values and implausible future timestamps.
-            if (utc == DateTime.MinValue || utc == DateTime.MaxValue || utc > now.AddDays(1))
-            {
-                return;
-            }
-
-            list.Add((DateTime.SpecifyKind(utc, DateTimeKind.Utc), source));
+            rootedPath = exePath;
         }
 
-        if (OperatingSystem.IsWindows())
+        if (!string.IsNullOrWhiteSpace(rootedPath))
         {
-            var exeName = NormalizeExeName(exePath);
-
-            // Installed applications: registry evidence is useful even when the executable was
-            // replaced by an update after MiniMixer's first run.
-            if (!string.IsNullOrWhiteSpace(exeName) &&
-                TryGetInstallDateFromUninstallRegistry(exeName, rootedPath, displayNameHint, out var registryUtc))
+            try
             {
-                AddCandidate(candidates, registryUtc, "windows_apps_registry", nowUtc);
-            }
+                var exeCreatedUtc = File.GetCreationTimeUtc(rootedPath);
+                var directory = Path.GetDirectoryName(rootedPath);
+                var dirCreatedUtc = !string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory)
+                    ? Directory.GetCreationTimeUtc(directory)
+                    : DateTime.MinValue;
 
-            // Embedded/shared audio runtimes can expose a helper executable while the session
-            // display name belongs to the actual host application. Keep that source explicit in
-            // diagnostics, but it participates in the same earliest-presence rule.
-            if (IsDisplayNameDifferentFromExecutable(displayNameHint, rootedPath) &&
-                TryGetInstallDateFromUninstallRegistry(exeName, rootedPath, displayNameHint, out var displayRegistryUtc))
-            {
-                AddCandidate(candidates, displayRegistryUtc, "windows_apps_registry_display", nowUtc);
-            }
-
-            // Steam's appmanifest CreationTime is a local-presence signal. LastUpdated is
-            // intentionally not used because game updates must not turn an old game into a new app.
-            if (!string.IsNullOrWhiteSpace(rootedPath) &&
-                TryGetInstallSignalFromSteamManifest(rootedPath, out var steamUtc))
-            {
-                AddCandidate(candidates, steamUtc, "steam_appmanifest_creation", nowUtc);
-            }
-        }
-
-        // Portable/ZIP fallback. The executable's NTFS CreationTime is the best generally
-        // available signal for when that concrete file arrived on this Windows installation.
-        // Do NOT use an arbitrary parent folder: D:\Portable may be years old while a new EXE
-        // was copied there today. A dedicated app folder is used only when its name strongly
-        // resembles the app; conflicting old/new weak evidence is then treated as unresolved.
-        if (!string.IsNullOrWhiteSpace(rootedPath) &&
-            TryGetPortablePresenceSignal(rootedPath, displayNameHint, nowUtc, out var portableUtc, out var portableSource))
-        {
-            AddCandidate(candidates, portableUtc, portableSource, nowUtc);
-        }
-
-        if (candidates.Count == 0)
-        {
-            _presenceSignalCache[cacheKey] = (nowUtc, DateTime.MinValue, string.Empty);
-            return false;
-        }
-
-        // Earliest credible evidence is authoritative for "already present". This is a
-        // conservative safety rule: later updater/file timestamps can never make an older app new.
-        var selected = candidates
-            .OrderBy(c => c.Utc)
-            .ThenBy(c => c.Source, StringComparer.Ordinal)
-            .First();
-
-        presenceSignalUtc = selected.Utc;
-        presenceSignalSource = selected.Source;
-        _presenceSignalCache[cacheKey] = (nowUtc, presenceSignalUtc, presenceSignalSource);
-        return true;
-    }
-
-    private bool TryGetPortablePresenceSignal(
-        string rootedExePath,
-        string displayNameHint,
-        DateTime nowUtc,
-        out DateTime presenceSignalUtc,
-        out string presenceSignalSource)
-    {
-        presenceSignalUtc = DateTime.MinValue;
-        presenceSignalSource = string.Empty;
-
-        try
-        {
-            var exeCreatedUtc = File.GetCreationTimeUtc(rootedExePath);
-            if (exeCreatedUtc == DateTime.MinValue || exeCreatedUtc > nowUtc.AddDays(1))
-            {
-                return false;
-            }
-
-            if (TryFindDedicatedAppDirectory(rootedExePath, displayNameHint, out var dedicatedDirectory))
-            {
-                var dirCreatedUtc = Directory.GetCreationTimeUtc(dedicatedDirectory);
-                if (dirCreatedUtc != DateTime.MinValue && dirCreatedUtc <= nowUtc.AddDays(1))
+                signalUtc = exeCreatedUtc > dirCreatedUtc ? exeCreatedUtc : dirCreatedUtc;
+                if (signalUtc != DateTime.MinValue)
                 {
-                    // Earliest local evidence wins. In particular, an old stable app root
-                    // prevents a newly replaced executable in a version/bin subfolder from
-                    // making the app look new. Generic collection folders are ignored.
-                    presenceSignalUtc = exeCreatedUtc <= dirCreatedUtc ? exeCreatedUtc : dirCreatedUtc;
-                    presenceSignalSource = "portable_exe_and_appdir_creation";
-                    return true;
+                    signalSource = "file_timestamps";
                 }
             }
-
-            // Generic collection folders (e.g. D:\Portable) are intentionally ignored.
-            presenceSignalUtc = exeCreatedUtc;
-            presenceSignalSource = "portable_exe_creation";
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static bool TryFindDedicatedAppDirectory(string rootedExePath, string displayNameHint, out string directoryPath)
-    {
-        directoryPath = string.Empty;
-        var parent = Path.GetDirectoryName(rootedExePath);
-        if (string.IsNullOrWhiteSpace(parent))
-        {
-            return false;
-        }
-
-        DirectoryInfo? cursor;
-        try
-        {
-            cursor = new DirectoryInfo(parent);
-        }
-        catch
-        {
-            return false;
-        }
-
-        // Look through a few local ancestors so version/bin layouts such as
-        // App\app-1.2.3\App.exe still find the stable App directory.
-        for (var depth = 0; cursor != null && depth < 4; depth++, cursor = cursor.Parent)
-        {
-            if (!cursor.Exists)
+            catch
             {
-                continue;
-            }
-
-            if (IsLikelyDedicatedAppDirectory(cursor.FullName, rootedExePath, displayNameHint))
-            {
-                directoryPath = cursor.FullName;
-                return true;
+                signalUtc = DateTime.MinValue;
             }
         }
 
-        return false;
-    }
-
-    private static bool IsLikelyDedicatedAppDirectory(string directoryPath, string rootedExePath, string displayNameHint)
-    {
-        var directoryName = NormalizeTextKey(Path.GetFileName(directoryPath));
-        var exeName = NormalizeTextKey(Path.GetFileNameWithoutExtension(rootedExePath));
-        var displayName = NormalizeTextKey(displayNameHint);
-
-        if (directoryName.Length < 3 || IsGenericAppSubdirectory(directoryName))
+        // Fallback 1: vorhandene Rule-Historie fuer gleiche EXE-Namen nutzen.
+        if (signalUtc == DateTime.MinValue)
         {
-            return false;
+            var exeName = NormalizeExeName(exePath);
+            if (!string.IsNullOrWhiteSpace(exeName))
+            {
+                foreach (var knownPath in _ruleStore.Apps.Keys)
+                {
+                    if (!Path.IsPathRooted(knownPath) || !File.Exists(knownPath))
+                    {
+                        continue;
+                    }
+
+                    if (!string.Equals(NormalizeExeName(knownPath), exeName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var candidate = File.GetCreationTimeUtc(knownPath);
+                        if (signalUtc == DateTime.MinValue || candidate < signalUtc)
+                        {
+                            signalUtc = candidate;
+                            signalSource = "rule_history";
+                        }
+                    }
+                    catch
+                    {
+                        // ignore
+                    }
+                }
+            }
         }
 
-        // Display name is usually more specific than helper executable names such as app.exe.
-        if (displayName.Length >= 4 &&
-            (directoryName.Contains(displayName, StringComparison.Ordinal) || displayName.Contains(directoryName, StringComparison.Ordinal)))
+        // Fallback 2: Windows Uninstall-Registry
+        if (signalUtc == DateTime.MinValue)
         {
-            return true;
+            var exeName = NormalizeExeName(exePath);
+            if (OperatingSystem.IsWindows() &&
+                !string.IsNullOrWhiteSpace(exeName) &&
+                TryGetInstallDateFromUninstallRegistry(exeName, rootedPath, out var uninstallInstallUtc))
+            {
+                signalUtc = uninstallInstallUtc;
+                signalSource = "windows_apps_registry";
+            }
         }
 
-        return exeName.Length >= 4 && !IsGenericAppSubdirectory(exeName) &&
-               (directoryName.Contains(exeName, StringComparison.Ordinal) || exeName.Contains(directoryName, StringComparison.Ordinal));
-    }
-
-    private static bool IsGenericAppSubdirectory(string normalizedName)
-    {
-        if (normalizedName is "app" or "bin" or "current" or "release" or "releases" or
-            "x64" or "x86" or "win64" or "win32" or "program" or "programs")
+        // Fallback 3: Steam appmanifest (wichtig fuer viele Steam-Demos/Indie-Spiele)
+        if (signalUtc == DateTime.MinValue &&
+            OperatingSystem.IsWindows() &&
+            !string.IsNullOrWhiteSpace(rootedPath) &&
+            TryGetInstallSignalFromSteamManifest(rootedPath, out var steamInstallUtc))
         {
-            return true;
+            signalUtc = steamInstallUtc;
+            signalSource = "steam_appmanifest";
         }
 
-        return Regex.IsMatch(normalizedName, @"^(?:app|version|ver|v)\d", RegexOptions.IgnoreCase);
+        _installSignalCache[exePath] = (nowUtc, signalUtc, signalSource);
+        installSignalUtc = signalUtc;
+        installSignalSource = signalSource;
+        return installSignalUtc != DateTime.MinValue;
     }
 
     private bool TryGetInstallSignalFromSteamManifest(string rootedExePath, out DateTime installSignalUtc)
@@ -601,10 +481,10 @@ public class GuardEngine : IGuardEngine
     private Dictionary<string, DateTime> LoadSteamInstallSignalsByDir(string steamAppsDir)
     {
         var nowUtc = DateTime.UtcNow;
-        if (_steamPresenceSignalCache.TryGetValue(steamAppsDir, out var cached) &&
-            (nowUtc - cached.CheckedUtc) <= SteamPresenceSignalCacheTtl)
+        if (_steamInstallSignalCache.TryGetValue(steamAppsDir, out var cached) &&
+            (nowUtc - cached.CheckedUtc) <= SteamInstallSignalCacheTtl)
         {
-            return cached.PresenceSignalsUtcByDir;
+            return cached.InstallSignalsUtcByDir;
         }
 
         var map = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
@@ -624,9 +504,8 @@ public class GuardEngine : IGuardEngine
                         continue;
                     }
 
-                    if (!map.TryGetValue(installDirName, out var existing) || installSignalUtc < existing)
+                    if (!map.TryGetValue(installDirName, out var existing) || installSignalUtc > existing)
                     {
-                        // Presence semantics use the earliest local manifest evidence.
                         map[installDirName] = installSignalUtc;
                     }
                 }
@@ -637,7 +516,7 @@ public class GuardEngine : IGuardEngine
             // ignore IO/permissions and keep empty map
         }
 
-        _steamPresenceSignalCache[steamAppsDir] = (nowUtc, map);
+        _steamInstallSignalCache[steamAppsDir] = (nowUtc, map);
         return map;
     }
 
@@ -722,11 +601,13 @@ public class GuardEngine : IGuardEngine
                 return false;
             }
 
-            // Steam's LastUpdated changes on every update and is therefore not an
-            // installation timestamp. Prefer the manifest creation time, which is the
-            // conservative signal for when this local installation first appeared.
-            installSignalUtc = File.GetCreationTimeUtc(manifestPath);
-            if (installSignalUtc == DateTime.MinValue)
+            var rawLastUpdated = ReadSteamVdfValue(text, "LastUpdated");
+            if (long.TryParse(rawLastUpdated, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unixSeconds) &&
+                unixSeconds > 0)
+            {
+                installSignalUtc = DateTimeOffset.FromUnixTimeSeconds(unixSeconds).UtcDateTime;
+            }
+            else
             {
                 installSignalUtc = File.GetLastWriteTimeUtc(manifestPath);
             }
@@ -846,7 +727,7 @@ public class GuardEngine : IGuardEngine
     }
 
     [SupportedOSPlatform("windows")]
-    private static bool TryGetInstallDateFromUninstallRegistry(string exeName, string rootedExePath, string displayNameHint, out DateTime installUtc)
+    private static bool TryGetInstallDateFromUninstallRegistry(string exeName, string rootedExePath, out DateTime installUtc)
     {
         installUtc = DateTime.MinValue;
         var normalizedExe = NormalizeExeName(exeName);
@@ -895,14 +776,12 @@ public class GuardEngine : IGuardEngine
                         var installLocationContainsExePath = !string.IsNullOrWhiteSpace(installLocation) &&
                                                              !string.IsNullOrWhiteSpace(normalizedRootedExePath) &&
                                                              normalizedRootedExePath.StartsWith(AppendDirectorySeparator(installLocation), StringComparison.OrdinalIgnoreCase);
-                        var displayHintMatches = StrongDisplayNameMatch(displayName, displayNameHint);
 
                         var match = string.Equals(iconName, normalizedExe, StringComparison.OrdinalIgnoreCase) ||
                                     locationContainsExe ||
                                     displayMentionsExe ||
                                     iconPathMatchesExe ||
-                                    installLocationContainsExePath ||
-                                    displayHintMatches;
+                                    installLocationContainsExePath;
                         if (!match)
                         {
                             continue;
@@ -928,66 +807,6 @@ public class GuardEngine : IGuardEngine
 
         installUtc = candidates.Min();
         return true;
-    }
-
-    private static bool IsDisplayNameDifferentFromExecutable(string displayName, string rootedExePath)
-    {
-        var displayKey = NormalizeTextKey(displayName);
-        var exeKey = NormalizeTextKey(Path.GetFileNameWithoutExtension(rootedExePath ?? string.Empty));
-        if (displayKey.Length < 4 || exeKey.Length < 2)
-        {
-            return false;
-        }
-
-        return !displayKey.Contains(exeKey, StringComparison.Ordinal) &&
-               !exeKey.Contains(displayKey, StringComparison.Ordinal);
-    }
-
-    private static bool StrongDisplayNameMatch(string registryDisplayName, string sessionDisplayName)
-    {
-        var registryKey = NormalizeTextKey(registryDisplayName);
-        var sessionKey = NormalizeTextKey(sessionDisplayName);
-        if (registryKey.Length < 4 || sessionKey.Length < 4)
-        {
-            return false;
-        }
-
-        if (string.Equals(registryKey, sessionKey, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        // Permit a version/edition suffix only for sufficiently specific names.
-        if (sessionKey.Length >= 8 && registryKey.StartsWith(sessionKey, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        if (registryKey.Length >= 8 && sessionKey.StartsWith(registryKey, StringComparison.Ordinal))
-        {
-            return true;
-        }
-
-        return false;
-    }
-
-    private static string NormalizeTextKey(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return string.Empty;
-        }
-
-        var builder = new StringBuilder(value.Length);
-        foreach (var ch in value.Trim().ToLowerInvariant())
-        {
-            if (char.IsLetterOrDigit(ch))
-            {
-                builder.Append(ch);
-            }
-        }
-
-        return builder.ToString();
     }
 
     private static string NormalizeDisplayIconPath(string raw)

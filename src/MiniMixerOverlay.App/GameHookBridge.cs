@@ -26,8 +26,15 @@ internal sealed class GameHookForegroundWindowInfo
 
 internal static class GameHookBridge
 {
-    private const int ProcessQueryLimitedInformation = 0x1000;
-    private const ushort ImageFileMachineUnknown = 0x0;
+    // Migration safety gate: archived vendor helper and n_overlay DLL
+    // must NEVER be loaded by the active product, even if an old custom
+    // AssetsPath points directly into the legacy archive.
+    internal static bool LegacyVendorInjectionDisabled => true;
+    // Deliberate experimental opt-in; default app launch stays fail-closed.
+    internal static bool NativePreviewEnabled => Array.Exists(Environment.GetCommandLineArgs(),
+        arg => string.Equals(arg, "--native-hook-preview", StringComparison.OrdinalIgnoreCase)) &&
+        !Array.Exists(Environment.GetCommandLineArgs(),
+        arg => string.Equals(arg, "--graphics-ipc-only", StringComparison.OrdinalIgnoreCase));
 
     public static GameHookInjectResult InjectByWindowTitle(string titleContains, string assetsDirectory)
     {
@@ -44,13 +51,85 @@ internal static class GameHookBridge
         return InjectCandidate(target, assetsDirectory, titleContains);
     }
 
-    public static GameHookInjectResult InjectForegroundWindow(string assetsDirectory)
+    // Auto-Hook is bound to the HWND/PID/title approved by the selection owner.
+    // Never select an unrelated foreground window on a background worker.
+    public static GameHookInjectResult InjectQualifiedForegroundWindow(
+        GameHookForegroundWindowInfo qualified, string assetsDirectory)
     {
-        var target = FindTargetWindow(string.Empty);
-        return InjectCandidate(target, assetsDirectory, string.Empty);
+        if (!TryResolveQualifiedForegroundWindow(qualified, out var target))
+        {
+            return new GameHookInjectResult
+            {
+                Success = false,
+                Message = "Auto-Hook abgebrochen: Vordergrundfenster oder Prozess hat gewechselt.",
+                ProcessId = qualified?.ProcessId ?? 0,
+                WindowTitle = qualified?.WindowTitle ?? string.Empty
+            };
+        }
+
+        return InjectCandidate(target, assetsDirectory, string.Empty, qualified);
     }
 
-    public static bool TryGetForegroundWindowInfo(out GameHookForegroundWindowInfo info)
+    // Same canonical qualification path plus an optional runtime-session
+    // cancellation gate for background auto-attach after Stop/restart.
+    internal static GameHookInjectResult InjectQualifiedForegroundWindowGated(
+        GameHookForegroundWindowInfo qualified, string assetsDirectory,
+        Func<bool> sessionEligible)
+    {
+        if (sessionEligible == null || !sessionEligible())
+            return new GameHookInjectResult
+            {
+                Message = "Native Preview: Runtime-Session bereits beendet.",
+                ProcessId = qualified?.ProcessId ?? 0
+            };
+        if (!TryResolveQualifiedForegroundWindow(qualified, out var target))
+            return new GameHookInjectResult
+            {
+                Message = "Auto-Hook abgebrochen: qualifiziertes Fenster gewechselt.",
+                ProcessId = qualified?.ProcessId ?? 0
+            };
+        return InjectCandidate(target, assetsDirectory, string.Empty, qualified, sessionEligible);
+    }
+
+    private static bool TryResolveQualifiedForegroundWindow(
+        GameHookForegroundWindowInfo qualified, out WindowCandidate current)
+    {
+        current = default;
+        if (qualified == null || qualified.Hwnd == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var hwnd = GetForegroundWindow();
+        if (hwnd != qualified.Hwnd)
+        {
+            return false;
+        }
+
+        current = CreateCandidate(hwnd);
+        return MatchesQualifiedWindow(qualified, hwnd, current.ProcessId, current.Title);
+    }
+
+    // Pure identity gate: independently testable without launching an injector.
+    private static bool MatchesQualifiedWindow(
+        GameHookForegroundWindowInfo qualified, IntPtr foregroundHwnd,
+        uint currentProcessId, string currentTitle)
+    {
+        return qualified != null &&
+               qualified.Hwnd != IntPtr.Zero &&
+               qualified.ProcessId != 0 &&
+               !string.IsNullOrWhiteSpace(qualified.WindowTitle) &&
+               qualified.Hwnd == foregroundHwnd &&
+               qualified.ProcessId == currentProcessId &&
+               string.Equals(qualified.WindowTitle, currentTitle, StringComparison.Ordinal);
+    }
+
+    private static bool IsUsableForegroundWindow(uint pid, string? title, bool requireTitle) =>
+        pid != 0 && (!requireTitle || !string.IsNullOrWhiteSpace(title));
+
+    // Foreground audio needs only a PID. Game-Hook callers keep the strict title gate.
+    public static bool TryGetForegroundWindowInfo(out GameHookForegroundWindowInfo info,
+        bool requireTitle = true)
     {
         info = new GameHookForegroundWindowInfo();
 
@@ -61,7 +140,7 @@ internal static class GameHookBridge
         }
 
         var candidate = CreateCandidate(hwnd);
-        if (candidate.Hwnd == IntPtr.Zero || candidate.ProcessId == 0 || string.IsNullOrWhiteSpace(candidate.Title))
+        if (candidate.Hwnd == IntPtr.Zero || !IsUsableForegroundWindow(candidate.ProcessId, candidate.Title, requireTitle))
         {
             return false;
         }
@@ -88,7 +167,8 @@ internal static class GameHookBridge
         return true;
     }
 
-    private static GameHookInjectResult InjectCandidate(WindowCandidate target, string assetsDirectory, string titleContains)
+    private static GameHookInjectResult InjectCandidate(WindowCandidate target, string assetsDirectory, string titleContains,
+        GameHookForegroundWindowInfo? qualified = null, Func<bool>? sessionEligible = null)
     {
         if (target.Hwnd == IntPtr.Zero || target.ProcessId == 0)
         {
@@ -101,115 +181,31 @@ internal static class GameHookBridge
             };
         }
 
-        var is64BitTarget = Is64BitProcess(target.ProcessId);
-        var helperPath = System.IO.Path.Combine(
-            assetsDirectory,
-            is64BitTarget ? "injector_helper.x64.exe" : "injector_helper.exe");
-        var dllPath = System.IO.Path.Combine(
-            assetsDirectory,
-            is64BitTarget ? "n_overlay.x64.dll" : "n_overlay.dll");
-
-        if (!System.IO.File.Exists(helperPath))
+        if (!NativePreviewEnabled)
         {
             return new GameHookInjectResult
             {
-                Success = false,
-                Message = $"Injector fehlt: {helperPath}",
-                WindowTitle = target.Title,
+                Message = "Native Hook ist ein Preview; Start mit --native-hook-preview erforderlich.",
                 ProcessId = target.ProcessId,
-                HelperPath = helperPath,
-                DllPath = dllPath
+                WindowTitle = target.Title
             };
         }
 
-        if (!System.IO.File.Exists(dllPath))
+        // Keep the established HWND/PID/title selection as the only authority.
+        // The native implementation never looks up a different foreground target.
+        bool StillSameTarget()
         {
-            return new GameHookInjectResult
-            {
-                Success = false,
-                Message = $"Overlay-DLL fehlt: {dllPath}",
-                WindowTitle = target.Title,
-                ProcessId = target.ProcessId,
-                HelperPath = helperPath,
-                DllPath = dllPath
-            };
+            var current = CreateCandidate(target.Hwnd);
+            return current.Hwnd == target.Hwnd &&
+                   current.ProcessId == target.ProcessId &&
+                   string.Equals(current.Title, target.Title, StringComparison.Ordinal) &&
+                   (qualified == null || TryResolveQualifiedForegroundWindow(qualified, out _)) &&
+                   (sessionEligible == null || sessionEligible());
         }
 
-        try
-        {
-            var hwndArg = unchecked((uint)(ulong)target.Hwnd.ToInt64());
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = helperPath,
-                Arguments = $"{hwndArg} \"{dllPath}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-
-            using var process = Process.Start(startInfo);
-            if (process == null)
-            {
-                return new GameHookInjectResult
-                {
-                    Success = false,
-                    Message = "Injector konnte nicht gestartet werden.",
-                    WindowTitle = target.Title,
-                    ProcessId = target.ProcessId,
-                    HelperPath = helperPath,
-                    DllPath = dllPath
-                };
-            }
-
-            if (!process.WaitForExit(6000))
-            {
-                try
-                {
-                    process.Kill(entireProcessTree: true);
-                }
-                catch
-                {
-                    // ignore
-                }
-
-                return new GameHookInjectResult
-                {
-                    Success = false,
-                    Message = "Injector-Timeout. Bitte erneut versuchen.",
-                    WindowTitle = target.Title,
-                    ProcessId = target.ProcessId,
-                    HelperPath = helperPath,
-                    DllPath = dllPath
-                };
-            }
-
-            var success = process.ExitCode == 0;
-            return new GameHookInjectResult
-            {
-                Success = success,
-                Message = success
-                    ? $"Injection ausgefuehrt fuer '{target.Title}' (PID {target.ProcessId})."
-                    : $"Injector ExitCode {process.ExitCode} fuer '{target.Title}'.",
-                WindowTitle = target.Title,
-                ProcessId = target.ProcessId,
-                HelperPath = helperPath,
-                DllPath = dllPath
-            };
-        }
-        catch (Exception ex)
-        {
-            return new GameHookInjectResult
-            {
-                Success = false,
-                Message = $"Injection-Fehler: {ex.Message}",
-                WindowTitle = target.Title,
-                ProcessId = target.ProcessId,
-                HelperPath = helperPath,
-                DllPath = dllPath
-            };
-        }
+        return NativeGameHookLoader.Attach(target.ProcessId, target.Hwnd, target.Title,
+            assetsDirectory, StillSameTarget);
     }
-
     public static List<string> SuggestTopWindowTitles(string titleContains, int limit = 8)
     {
         var list = new List<string>();
@@ -309,57 +305,6 @@ internal static class GameHookBridge
         };
     }
 
-    private static bool Is64BitProcess(uint processId)
-    {
-        if (!Environment.Is64BitOperatingSystem)
-        {
-            return false;
-        }
-
-        var processHandle = OpenProcess(ProcessQueryLimitedInformation, false, processId);
-        if (processHandle == IntPtr.Zero)
-        {
-            return true;
-        }
-
-        try
-        {
-            if (TryIsWow64Process2(processHandle, out var processMachine))
-            {
-                return processMachine == ImageFileMachineUnknown;
-            }
-
-            if (IsWow64Process(processHandle, out var wow64))
-            {
-                return !wow64;
-            }
-        }
-        finally
-        {
-            _ = CloseHandle(processHandle);
-        }
-
-        return true;
-    }
-
-    private static bool TryIsWow64Process2(IntPtr processHandle, out ushort processMachine)
-    {
-        processMachine = ImageFileMachineUnknown;
-        try
-        {
-            if (IsWow64Process2(processHandle, out processMachine, out _))
-            {
-                return true;
-            }
-        }
-        catch (EntryPointNotFoundException)
-        {
-            // fallback below
-        }
-
-        return false;
-    }
-
     [StructLayout(LayoutKind.Sequential)]
     private readonly struct WindowCandidate
     {
@@ -388,15 +333,5 @@ internal static class GameHookBridge
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(int processAccess, bool bInheritHandle, uint processId);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr hObject);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool IsWow64Process(IntPtr hProcess, out bool wow64Process);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool IsWow64Process2(IntPtr processHandle, out ushort processMachine, out ushort nativeMachine);
 }

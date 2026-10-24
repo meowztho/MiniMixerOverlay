@@ -16,6 +16,7 @@ public class JsonRuleStore : IRuleStore
     private readonly string _filePath;
     private readonly JsonSerializerOptions _jsonOptions;
     private RuleData _data;
+    private bool _saveBlocked;
 
     public DateTime ToolFirstRunUtc => _data.ToolFirstRunUtc;
     public Dictionary<string, AppRule> Apps => _data.Apps;
@@ -39,18 +40,21 @@ public class JsonRuleStore : IRuleStore
 
     public void Load()
     {
+        _saveBlocked = false;
         try
         {
             if (File.Exists(_filePath))
             {
                 var json = File.ReadAllText(_filePath);
-                var loaded = JsonSerializer.Deserialize<RuleData>(json, _jsonOptions);
-                if (loaded != null)
+                var loaded = JsonSerializer.Deserialize<RuleData>(json, _jsonOptions)
+                    ?? throw new JsonException("RuleStore root must be a JSON object");
+                loaded.Apps = NormalizeExeKeys(loaded.Apps, out var hadCollisions);
+                if (hadCollisions)
                 {
-                    loaded.Apps ??= new Dictionary<string, AppRule>(StringComparer.OrdinalIgnoreCase);
-                    _data = loaded;
-                    MigrateLegacyRuleKeys();
+                    // Preserve the raw conflicting records before any later save can merge them.
+                    _saveBlocked = !JsonFileRecovery.TryPreserve(_filePath, "case-conflicts");
                 }
+                _data = loaded;
             }
             else
             {
@@ -62,151 +66,20 @@ public class JsonRuleStore : IRuleStore
         catch (Exception ex)
         {
             System.Diagnostics.Debug.WriteLine($"RuleStore Load fehlgeschlagen: {ex.Message}");
-            // Bei Fehler: Defaults verwenden
+            // Keep the damaged file recoverable; block writes if preservation failed.
+            _saveBlocked = !JsonFileRecovery.TryPreserve(_filePath, "corrupt");
             _data = new RuleData { ToolFirstRunUtc = DateTime.UtcNow };
         }
     }
 
-
-    private void MigrateLegacyRuleKeys()
-    {
-        var migrated = new Dictionary<string, AppRule>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var pair in _data.Apps)
-        {
-            var rule = pair.Value ?? new AppRule();
-            EnsureRuleShape(rule);
-            var key = !string.IsNullOrWhiteSpace(rule.AppIdentityKey)
-                ? rule.AppIdentityKey
-                : AppIdentity.CreateKey(pair.Key, rule.ExeName, rule.DisplayName);
-
-            rule.AppIdentityKey = key;
-            if (!rule.BaselineAtFirstRun && rule.FirstSeenUtc != default &&
-                rule.FirstSeenUtc <= _data.ToolFirstRunUtc.AddSeconds(2))
-            {
-                rule.BaselineAtFirstRun = true;
-            }
-
-            if (rule.BaselineAtFirstRun)
-            {
-                rule.DiscoveryStatus = AppDiscoveryStatus.Baseline;
-            }
-            else if (rule.DiscoveryStatus == AppDiscoveryStatus.InstalledBeforeTool)
-            {
-                // v10 wording was installer-centric. Preserve the decision but migrate the
-                // semantic owner to "present before MiniMixer first run".
-                rule.DiscoveryStatus = AppDiscoveryStatus.PresentBeforeFirstRun;
-            }
-            else if (rule.DiscoveryStatus == AppDiscoveryStatus.Unknown && rule.DeviceProfiles.Count == 0)
-            {
-                if (rule.AutoApplied)
-                {
-                    // Legacy AutoApplied rules already passed the previous new-app guard.
-                    rule.DiscoveryStatus = AppDiscoveryStatus.NewEligible;
-                }
-                else if (rule.FirstSeenUtc != default)
-                {
-                    // Conservative migration: a pre-v10 persisted rule is already a known app.
-                    // Treat it as present before the MiniMixer baseline; do not retroactively
-                    // auto-limit it merely because older versions lacked presence evidence.
-                    rule.DiscoveryStatus = AppDiscoveryStatus.PresentBeforeFirstRun;
-                }
-            }
-            if (string.IsNullOrWhiteSpace(rule.LastKnownExePath) && Path.IsPathRooted(pair.Key))
-            {
-                rule.LastKnownExePath = pair.Key;
-            }
-
-            if (!migrated.TryGetValue(key, out var existing))
-            {
-                migrated[key] = rule;
-                continue;
-            }
-
-            // Prefer explicit user intent. If both rules are equally strong, keep the
-            // most recently seen one as the source for LastKnownVolume/current metadata.
-            var existingPriority = RulePriority(existing);
-            var incomingPriority = RulePriority(rule);
-            var incomingPreferred = incomingPriority > existingPriority ||
-                (incomingPriority == existingPriority && rule.LastSeenUtc > existing.LastSeenUtc);
-
-            migrated[key] = incomingPreferred
-                ? MergeRules(existing, rule)
-                : MergeRules(rule, existing);
-        }
-
-        _data.Apps = migrated;
-        Save();
-    }
-
-    private static int RulePriority(AppRule rule)
-    {
-        var score = 0;
-        if (rule.ManualOverride) score += 8;
-        if (rule.Locked) score += 4;
-        if (rule.Favorite) score += 2;
-        if (rule.AutoApplied) score += 1;
-        return score;
-    }
-
-    private static AppRule MergeRules(AppRule secondary, AppRule preferred)
-    {
-        preferred.FirstSeenUtc = MinNonDefault(preferred.FirstSeenUtc, secondary.FirstSeenUtc);
-        preferred.LastSeenUtc = preferred.LastSeenUtc >= secondary.LastSeenUtc ? preferred.LastSeenUtc : secondary.LastSeenUtc;
-        preferred.ManualOverride |= secondary.ManualOverride;
-        preferred.AutoApplied |= secondary.AutoApplied;
-        preferred.Locked |= secondary.Locked;
-        preferred.Favorite |= secondary.Favorite;
-        preferred.BaselineAtFirstRun |= secondary.BaselineAtFirstRun;
-        if (string.IsNullOrWhiteSpace(preferred.LastKnownExePath)) preferred.LastKnownExePath = secondary.LastKnownExePath;
-        if (string.IsNullOrWhiteSpace(preferred.ExeName)) preferred.ExeName = secondary.ExeName;
-        if (string.IsNullOrWhiteSpace(preferred.DisplayName)) preferred.DisplayName = secondary.DisplayName;
-
-        EnsureRuleShape(preferred);
-        EnsureRuleShape(secondary);
-        foreach (var pair in secondary.DeviceProfiles)
-        {
-            if (!preferred.DeviceProfiles.TryGetValue(pair.Key, out var existingProfile) ||
-                pair.Value.LastSeenUtc > existingProfile.LastSeenUtc)
-            {
-                preferred.DeviceProfiles[pair.Key] = pair.Value;
-            }
-        }
-
-        if (preferred.DiscoveryStatus == AppDiscoveryStatus.Unknown &&
-            secondary.DiscoveryStatus != AppDiscoveryStatus.Unknown)
-        {
-            preferred.DiscoveryStatus = secondary.DiscoveryStatus;
-            preferred.InstallSignalUtc = secondary.InstallSignalUtc;
-            preferred.InstallSignalSource = secondary.InstallSignalSource;
-        }
-
-        return preferred;
-    }
-
-    private static void EnsureRuleShape(AppRule rule)
-    {
-        rule.DeviceProfiles = rule.DeviceProfiles == null
-            ? new Dictionary<string, DeviceVolumeProfile>(StringComparer.OrdinalIgnoreCase)
-            : new Dictionary<string, DeviceVolumeProfile>(rule.DeviceProfiles, StringComparer.OrdinalIgnoreCase);
-
-        foreach (var pair in rule.DeviceProfiles)
-        {
-            pair.Value.DeviceId = string.IsNullOrWhiteSpace(pair.Value.DeviceId)
-                ? pair.Key
-                : pair.Value.DeviceId;
-        }
-    }
-
-    private static DateTime MinNonDefault(DateTime a, DateTime b)
-    {
-        if (a == default) return b;
-        if (b == default) return a;
-        return a <= b ? a : b;
-    }
-
     public void Save()
     {
+        if (_saveBlocked)
+        {
+            System.Diagnostics.Debug.WriteLine("RuleStore Save skipped: original JSON could not be backed up");
+            return;
+        }
+
         try
         {
             var directory = Path.GetDirectoryName(_filePath);
@@ -218,6 +91,12 @@ public class JsonRuleStore : IRuleStore
             // Atomar speichern: zuerst in temporäre Datei, dann umbenennen
             var tempPath = _filePath + ".tmp";
             var json = JsonSerializer.Serialize(_data, _jsonOptions);
+            // A normal shutdown often saves unchanged rules. Compare the current
+            // on-disk bytes, not a stale in-memory "last saved" flag: external
+            // edits/deletions must still go through the atomic write path.
+            if (File.Exists(_filePath) &&
+                string.Equals(File.ReadAllText(_filePath), json, StringComparison.Ordinal))
+                return;
             File.WriteAllText(tempPath, json);
 
             if (File.Exists(_filePath))
@@ -235,74 +114,53 @@ public class JsonRuleStore : IRuleStore
         }
     }
 
-    public AppRule? GetRule(string appIdentityKey)
+    private static Dictionary<string, AppRule> NormalizeExeKeys(Dictionary<string, AppRule>? source, out bool hadCollisions)
     {
-        if (!_data.Apps.TryGetValue(appIdentityKey, out var rule))
-        {
-            return null;
-        }
+        var result = new Dictionary<string, AppRule>(StringComparer.OrdinalIgnoreCase);
+        hadCollisions = false;
+        if (source == null) return result;
 
-        EnsureRuleShape(rule);
-        return rule;
-    }
-
-    public AppRule? ResolveRule(string appIdentityKey, string exePath, string exeName, string displayName)
-    {
-        if (_data.Apps.TryGetValue(appIdentityKey, out var direct))
+        foreach (var (exePath, candidate) in source)
         {
-            EnsureRuleShape(direct);
-            return direct;
-        }
-
-        // Lazy migration for identity-scheme upgrades. Only adopt an old rule when the
-        // executable name match is unique; display name is used as an additional guard.
-        var normalizedExe = Path.GetFileName(exeName ?? string.Empty);
-        if (string.IsNullOrWhiteSpace(normalizedExe))
-        {
-            normalizedExe = Path.GetFileName(exePath ?? string.Empty);
-        }
-
-        var candidates = new List<KeyValuePair<string, AppRule>>();
-        foreach (var pair in _data.Apps)
-        {
-            var rule = pair.Value;
-            var ruleExe = !string.IsNullOrWhiteSpace(rule.ExeName)
-                ? Path.GetFileName(rule.ExeName)
-                : Path.GetFileName(rule.LastKnownExePath);
-            if (!string.Equals(ruleExe, normalizedExe, StringComparison.OrdinalIgnoreCase))
+            if (!result.TryGetValue(exePath, out var existing))
             {
+                result[exePath] = candidate;
                 continue;
             }
 
-            if (!string.IsNullOrWhiteSpace(displayName) && !string.IsNullOrWhiteSpace(rule.DisplayName) &&
-                !string.Equals(rule.DisplayName.Trim(), displayName.Trim(), StringComparison.OrdinalIgnoreCase))
+            hadCollisions = true;
+            // Keep the latest manual choice over automatic state and never clear safety flags.
+            var preferred = existing.ManualOverride != candidate.ManualOverride
+                ? (existing.ManualOverride ? existing : candidate)
+                : (existing.LastSeenUtc >= candidate.LastSeenUtc ? existing : candidate);
+
+            result[exePath] = new AppRule
             {
-                continue;
-            }
-
-            candidates.Add(pair);
+                DisplayName = preferred.DisplayName,
+                ExeName = preferred.ExeName,
+                Classification = preferred.Classification,
+                FirstSeenUtc = existing.FirstSeenUtc <= candidate.FirstSeenUtc ? existing.FirstSeenUtc : candidate.FirstSeenUtc,
+                LastSeenUtc = existing.LastSeenUtc >= candidate.LastSeenUtc ? existing.LastSeenUtc : candidate.LastSeenUtc,
+                AutoApplied = existing.AutoApplied || candidate.AutoApplied,
+                ManualOverride = existing.ManualOverride || candidate.ManualOverride,
+                Locked = existing.Locked || candidate.Locked,
+                Favorite = existing.Favorite || candidate.Favorite,
+                AutoVolume = preferred.AutoVolume,
+                LastKnownVolume = preferred.LastKnownVolume
+            };
         }
 
-        if (candidates.Count != 1)
-        {
-            return null;
-        }
-
-        var adopted = candidates[0].Value;
-        adopted.AppIdentityKey = appIdentityKey;
-        if (!string.IsNullOrWhiteSpace(exePath)) adopted.LastKnownExePath = exePath;
-        if (!string.IsNullOrWhiteSpace(exeName)) adopted.ExeName = exeName;
-        if (!string.IsNullOrWhiteSpace(displayName)) adopted.DisplayName = displayName;
-        _data.Apps[appIdentityKey] = adopted;
-        Save();
-        return adopted;
+        return result;
     }
 
-    public void UpsertRule(string appIdentityKey, AppRule rule)
+    public AppRule? GetRule(string exePath)
     {
-        rule.AppIdentityKey = appIdentityKey;
-        EnsureRuleShape(rule);
-        _data.Apps[appIdentityKey] = rule;
+        return _data.Apps.TryGetValue(exePath, out var rule) ? rule : null;
+    }
+
+    public void UpsertRule(string exePath, AppRule rule)
+    {
+        _data.Apps[exePath] = rule;
         Save();
     }
 }

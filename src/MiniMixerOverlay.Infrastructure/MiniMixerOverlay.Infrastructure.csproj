@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\MiniMixerOverlay.Core\MiniMixerOverlay.Core.csproj" />
+    <InternalsVisibleTo Include="MiniMixerOverlay.GuardRegression" />
   </ItemGroup>
 
   <ItemGroup>

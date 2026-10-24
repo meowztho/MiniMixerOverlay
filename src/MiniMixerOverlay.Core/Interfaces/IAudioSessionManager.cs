@@ -1,6 +1,5 @@
 namespace MiniMixerOverlay.Core.Interfaces;
 
-using MiniMixerOverlay.Core;
 using MiniMixerOverlay.Core.Models;
 using System;
 using System.Collections.Generic;
@@ -21,9 +20,27 @@ public interface IAudioSessionManager
     void SetVolume(string sessionIdentifier, float volume);
 
     /// <summary>
+    /// Reports whether the provider accepted the requested write for an
+    /// existing session. Legacy test providers retain exception-based writes;
+    /// the real WASAPI owner overrides this for missing/stale sessions too.
+    /// </summary>
+    bool TrySetVolume(string sessionIdentifier, float volume)
+    {
+        SetVolume(sessionIdentifier, volume);
+        return true;
+    }
+
+    /// <summary>
     /// Setzt den Mute-Status einer Session.
     /// </summary>
     void SetMute(string sessionIdentifier, bool mute);
+
+    /// <summary>Reports confirmed acceptance or a missing/stale mute target.</summary>
+    bool TrySetMute(string sessionIdentifier, bool mute)
+    {
+        SetMute(sessionIdentifier, mute);
+        return true;
+    }
 
     /// <summary>
     /// Registriert einen Callback für neue Sessions.
@@ -60,22 +77,14 @@ public interface ISessionClassifier
 public interface IGuardEngine
 {
     /// <summary>
-    /// Prüft, ob eine neue Anwendung automatisch auf die konfigurierte Ziel-Lautstaerke gesetzt werden darf.
+    /// Prüft, ob eine neue Anwendung automatisch auf 5% gesetzt werden darf.
     /// </summary>
     bool ShouldAutoApplyVolume(AppRule rule, DateTime toolFirstRunUtc);
 
     /// <summary>
     /// Wendet die Guard-Logik auf eine neue Session an.
     /// </summary>
-    GuardDecision EvaluateNewSession(
-        string appIdentityKey,
-        string exePath,
-        string displayName,
-        float currentVolume,
-        string outputDeviceId,
-        string outputDeviceName,
-        bool isBaselineScan = false,
-        IReadOnlyCollection<uint>? processIds = null);
+    GuardDecision EvaluateNewSession(string exePath, string displayName, float currentVolume, bool isBaselineScan = false, IReadOnlyCollection<uint>? processIds = null);
 }
 
 public class GuardDecision
@@ -84,7 +93,6 @@ public class GuardDecision
     public float TargetVolume { get; set; }
     public string Reason { get; set; } = string.Empty;
     public string DisplayName { get; set; } = string.Empty;
-    public string AppIdentityKey { get; set; } = string.Empty;
     public string InputExePath { get; set; } = string.Empty;
     public string EffectiveExePath { get; set; } = string.Empty;
     public bool IsBaselineScan { get; set; }
@@ -92,17 +100,9 @@ public class GuardDecision
     public bool RuleAutoApplied { get; set; }
     public bool RuleManualOverride { get; set; }
     public AppClassification Classification { get; set; } = AppClassification.Unknown;
-    public int? PresenceAgeDays { get; set; }
-    public DateTime? PresenceSignalUtc { get; set; }
-    public string PresenceSignalSource { get; set; } = string.Empty;
-    public string OutputDeviceId { get; set; } = string.Empty;
-    public string OutputDeviceName { get; set; } = string.Empty;
-    public AppDiscoveryStatus DiscoveryStatus { get; set; } = AppDiscoveryStatus.Unknown;
-    public bool DeviceProfileExisted { get; set; }
-    public bool DeviceProfileAutoApplied { get; set; }
-    public bool DeviceProfileManualOverride { get; set; }
-    public bool ApplyVolume { get; set; }
-    public bool ProfileRestore { get; set; }
+    public int? InstallAgeDays { get; set; }
+    public DateTime? InstallSignalUtc { get; set; }
+    public string InstallSignalSource { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -115,9 +115,8 @@ public interface IRuleStore
 
     void Load();
     void Save();
-    AppRule? GetRule(string appIdentityKey);
-    AppRule? ResolveRule(string appIdentityKey, string exePath, string exeName, string displayName);
-    void UpsertRule(string appIdentityKey, AppRule rule);
+    AppRule? GetRule(string exePath);
+    void UpsertRule(string exePath, AppRule rule);
 }
 
 /// <summary>
@@ -135,6 +134,7 @@ public class AppSettings
     public WindowSettings Window { get; set; } = new();
     public UiSettings Ui { get; set; } = new();
     public GameHookSettings GameHook { get; set; } = new();
+    public SystemSettings System { get; set; } = new();
 }
 
 public class WindowSettings
@@ -148,30 +148,32 @@ public class WindowSettings
     public int DockVisibleWidth { get; set; } = 72;
     public int DockRevealZoneWidth { get; set; } = 72;
     public string CornerSnapAnchor { get; set; } = "top-right";
-    public bool AlwaysOnTop { get; set; } = true;
-
-    // Optional manual anchor for the visible corner hint / hover target.
-    // Coordinates use the Windows virtual desktop, so secondary monitors are supported.
     public bool CornerHintManualPosition { get; set; }
     public double? CornerHintX { get; set; }
     public double? CornerHintY { get; set; }
+    public bool IsCollapsed { get; set; }
+    public bool AlwaysOnTop { get; set; } = true;
 }
 
 public class UiSettings
 {
+    public string Theme { get; set; } = "glass-dark";
     public string Language { get; set; } = "de";
-    public string OverlayMode { get; set; } = "desktop";
+    public string OverlayMode { get; set; } = "gamehook";
     public bool CornerHintShowDot { get; set; } = true;
+    public int CornerHintTransparencyPercent { get; set; } = 0;
     public bool CornerHintShowValue { get; set; } = true;
     public string CornerHintValueColor { get; set; } = "Auto";
     public bool CornerHintUseCustomValueColor { get; set; }
     public string CornerHintCustomValueColorHex { get; set; } = "#F5FCFF";
+    public bool ShowOnlyActiveAudio { get; set; } = true;
     public int VisibleApps { get; set; } = 5;
     public int RefreshIntervalMs { get; set; } = 1800;
     public bool BringToFrontOnHover { get; set; } = true;
     public bool CornerRevealEnabled { get; set; } = true;
     public bool AutoApplyToAllNewApps { get; set; } = true;
-    public int AutoVolumePercent { get; set; } = GuardDefaults.AutoVolumePercent;
+    public int AutoVolumePercent { get; set; } = 5;
+    public int AutoLimitMaxInstallAgeDays { get; set; } = 7;
     public bool UseWindowsAccentForGlass { get; set; } = true;
     public string GlassPalette { get; set; } = "Cyan";
     public bool GlassUseCustomColor { get; set; }
@@ -182,13 +184,23 @@ public class UiSettings
     public string GlassBorderColorHex { get; set; } = "#9CD2E8";
     public int GlassBorderThickness { get; set; } = 1;
     public int GlassBorderSmudge { get; set; } = 38;
+    public bool CompactMode { get; set; }
+    // Optional global shortcut for the existing tray-style mixer toggle.
+    // Disabled by default so games and other applications keep their keys.
+    public bool ToggleHotkeyEnabled { get; set; }
+    public string ToggleHotkeyKey { get; set; } = "M";
 }
 
 public class GameHookSettings
 {
-    public string AssetsPath { get; set; } = @"goverlay-master\goverlay-master\game-overlay\prebuilt";
+    public string AssetsPath { get; set; } = @"native\GameHook\candidate";
     public string TargetWindowTitle { get; set; } = string.Empty;
     public bool ForwardInputToOverlay { get; set; } = false;
     public bool AutoStartRuntime { get; set; } = true;
 }
 
+public class SystemSettings
+{
+    public bool StartWithWindows { get; set; }
+    public bool MinimizeToTray { get; set; } = true;
+}

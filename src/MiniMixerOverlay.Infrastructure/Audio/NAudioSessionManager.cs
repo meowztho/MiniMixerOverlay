@@ -14,6 +14,10 @@ using NAudio.CoreAudioApi;
 
 public class NAudioSessionManager : IAudioSessionManager
 {
+    internal const string MasterExeKey = "__system_master__";
+    internal const string MasterControlPrefix = "__system_master__|";
+    internal static string BuildMasterControlKey(string deviceId) => MasterControlPrefix + deviceId;
+
     private static readonly Role[] CandidateRoles =
     {
         Role.Console,
@@ -22,12 +26,22 @@ public class NAudioSessionManager : IAudioSessionManager
     };
 
     private readonly MMDeviceEnumerator _enumerator;
-    private readonly MMDevice _device;
-    private readonly Dictionary<string, AudioSessionControl> _sessions = new();
+    private readonly object _enumerationSync = new();
+    private readonly SessionSnapshotIndex<AudioSessionControl> _sessions = new();
+    // Polling owns these devices across refreshes. NAudio activates COM
+    // audio managers and creates callback infrastructure per new MMDevice;
+    // retaining an unchanged endpoint avoids repeating that native work.
+    // The role->ID mapping is re-read on EVERY scan, so unplugged devices
+    // are removed before publishing the new session map.
+    private readonly Dictionary<string, MMDevice> _scanDevices = new(StringComparer.OrdinalIgnoreCase);
+    private List<AudioSessionInfo> _lastCompleteEnumeration = new();
     private readonly Dictionary<string, MMDevice> _monitoredDevices = new(StringComparer.OrdinalIgnoreCase);
+    private bool _monitoringActive; // Guarded by _enumerationSync.
+
     private readonly DateTime _deferIconExtractionUntilUtc = DateTime.UtcNow.AddSeconds(18);
     private Action<AudioSessionInfo>? _onCreated;
     private Action<string>? _onDestroyed;
+    private int _monitoringGeneration;
 
     // Icons only once per exe path to avoid repeated disk I/O
     private static readonly Dictionary<string, byte[]?> _iconCache = new(StringComparer.OrdinalIgnoreCase);
@@ -44,194 +58,237 @@ public class NAudioSessionManager : IAudioSessionManager
         public string ExePath { get; init; } = string.Empty;
         public string ExeName { get; init; } = string.Empty;
         public string DisplayName { get; init; } = string.Empty;
-        public string CompanyName { get; init; } = string.Empty;
-        public string ProductName { get; init; } = string.Empty;
-        public string OriginalFilename { get; init; } = string.Empty;
     }
 
     public NAudioSessionManager()
     {
         _enumerator = new MMDeviceEnumerator();
-        _device = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Console);
     }
 
-    public List<AudioSessionInfo> EnumerateSessions()
+    public List<AudioSessionInfo> EnumerateSessions() => EnumerateSessions(out _);
+
+    private List<AudioSessionInfo> EnumerateSessions(out IReadOnlyList<AudioSessionInfo> addedSessions)
     {
-        var result = new List<AudioSessionInfo>();
-        _sessions.Clear();
-        try
+        addedSessions = Array.Empty<AudioSessionInfo>();
+        var removed = Array.Empty<string>();
+        List<MMDevice> obsoleteDevices = new();
+        List<AudioSessionInfo> result;
+        lock (_enumerationSync)
         {
-            var seenLogicalSessions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var defaultDeviceIds = GetDefaultRenderDeviceIds();
-            foreach (var device in EnumerateCandidateDevices())
+            result = new List<AudioSessionInfo>();
+            var controls = new Dictionary<string, AudioSessionControl>(StringComparer.OrdinalIgnoreCase);
+            try
             {
-                var deviceId = device.ID ?? string.Empty;
-                var deviceName = TryGetFriendlyName(device);
-                var isDefaultDevice = defaultDeviceIds.Contains(deviceId);
-                var mgr = device.AudioSessionManager;
-                var sessions = mgr.Sessions;
-                for (int i = 0; i < sessions.Count; i++)
+                var scanDevices = ResolveCurrentScanDevices(
+                    out var multimediaDevice, out obsoleteDevices);
+                if (_monitoringActive)
+                    SynchronizeMonitoringWithCurrentEndpoints(scanDevices);
+                foreach (var device in scanDevices)
                 {
-                    var session = sessions[i];
-                    if (session.State == NAudio.CoreAudioApi.Interfaces.AudioSessionState.AudioSessionStateExpired)
+                    // SessionCollection is a snapshot of the endpoint's
+                    // sessions. Update its enumeration while retaining the
+                    // existing endpoint/AudioSessionManager COM owner.
+                    var manager = device.AudioSessionManager;
+                    manager.RefreshSessions();
+                    var sessions = manager.Sessions;
+                    for (int i = 0; i < sessions.Count; i++)
                     {
-                        continue;
-                    }
+                        var session = sessions[i];
+                        if (session.State == NAudio.CoreAudioApi.Interfaces.AudioSessionState.AudioSessionStateExpired)
+                        {
+                            session.Dispose();
+                            continue;
+                        }
 
-                    var rawSid = string.Empty;
-                    uint pid = 0;
-                    try { rawSid = session.GetSessionIdentifier ?? string.Empty; } catch { }
-                    try { pid = session.GetProcessID; } catch { }
+                        var rawSid = string.Empty;
+                        uint pid = 0;
+                        try { rawSid = session.GetSessionIdentifier ?? string.Empty; } catch { }
+                        try { pid = session.GetProcessID; } catch { }
 
-                    // Session identifiers can be identical on different render endpoints.
-                    // Device identity is part of the logical session key by design.
-                    var logicalKey = string.IsNullOrWhiteSpace(rawSid)
-                        ? $"{deviceId}|pid:{pid}:display:{session.DisplayName}"
-                        : $"{deviceId}|{rawSid}";
-                    if (!seenLogicalSessions.Add(logicalKey))
-                    {
-                        continue;
-                    }
+                        // Identity includes the endpoint: identical WASAPI SIDs on two devices
+                        // represent different volume controls.
+                        var controlKey = BuildControlKey(device.ID, rawSid, pid, i);
+                        if (controls.ContainsKey(controlKey))
+                        {
+                            session.Dispose();
+                            continue;
+                        }
+                        var info = ExtractSessionInfo(session, controlKey);
+                        if (info == null)
+                        {
+                            // A short-lived/unreadable session must not block updates for other apps.
+                            // Keep only its previous known state, if any, until a later scan resolves it.
+                            if (_sessions.TryGet(controlKey, out var previous) && previous != null)
+                            {
+                                var previousInfo = _lastCompleteEnumeration.FirstOrDefault(
+                                    known => string.Equals(known.SessionIdentifier, controlKey, StringComparison.OrdinalIgnoreCase));
+                                if (previousInfo != null)
+                                {
+                                    controls.Add(controlKey, previous);
+                                    result.Add(previousInfo);
+                                }
+                            }
+                            // The current wrapper was not published, even when
+                            // its previously published control is reused.
+                            session.Dispose();
+                            continue;
+                        }
 
-                    var controlKey = BuildControlKey(deviceId, rawSid, pid, i, session.DisplayName ?? string.Empty);
-                    var info = ExtractSessionInfo(
-                        session,
-                        controlKey,
-                        deviceId,
-                        deviceName,
-                        isDefaultDevice);
-                    if (info != null)
-                    {
-                        Debug.WriteLine(
-                            $"[Audio] {info.DisplayName} | {info.ExeName} | {info.OutputDeviceName} | {info.Volume * 100:F0}%");
+                        controls.Add(controlKey, session);
                         result.Add(info);
-                        _sessions[info.SessionIdentifier] = session;
+                        Debug.WriteLine($"[Audio] {info.DisplayName} | {info.ExeName} | {info.Volume * 100:F0}%");
                     }
                 }
-            }
 
-            Debug.WriteLine($"[Audio] Total sessions: {result.Count}");
+                // System master volume is a device endpoint control, NOT the
+                // "System Sounds" CoreAudio application session. Bind only to
+                // the current default Multimedia render endpoint, which is
+                // also the target Windows uses for system-wide output volume.
+                try
+                {
+                    // This owner was resolved from the current Multimedia
+                    // default in this scan; no additional endpoint activation.
+                    if (multimediaDevice == null)
+                        throw new InvalidOperationException("No current default Multimedia render endpoint");
+                    var master = multimediaDevice.AudioEndpointVolume;
+                    result.Add(new AudioSessionInfo
+                    {
+                        SessionIdentifier = BuildMasterControlKey(multimediaDevice.ID),
+                        ProcessId = 0,
+                        ExePath = MasterExeKey,
+                        ExeName = "SystemMaster",
+                        DisplayName = "Systemlautstärke",
+                        Volume = master.MasterVolumeLevelScalar,
+                        IsMuted = master.Mute,
+                        IsSystemSound = false
+                    });
+                }
+                catch (Exception ex)
+                {
+                    // Never substitute a system-sounds session or another
+                    // endpoint when default master audio is unavailable.
+                    Debug.WriteLine($"[Audio] Master volume unavailable: {ex.Message}");
+                }
+
+                removed = _sessions.Replace(controls, out var addedKeys, out var retiredControls).ToArray();
+                // SessionControl implements IDisposable and owns an underlying
+                // COM session interface. Dispose previous scan wrappers now,
+                // rather than accumulating them until the next full GC.
+                // SetVolume/SetMute share this lock to exclude in-flight writes.
+                foreach (var retired in retiredControls)
+                {
+                    try
+                    {
+                        // NAudio caches SimpleAudioVolume on the session
+                        // control. It must NOT be disposed on every read or
+                        // manual mute/volume operation, only when the
+                        // published session wrapper is retired under the
+                        // shared command/refresh lock.
+                        retired.SimpleAudioVolume.Dispose();
+                        retired.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Audio] Retired session release failed: {ex.Message}");
+                        try { retired.Dispose(); } catch { }
+                    }
+                }
+                var addedSet = new HashSet<string>(addedKeys, StringComparer.OrdinalIgnoreCase);
+                addedSessions = result.Where(session => addedSet.Contains(session.SessionIdentifier)).ToArray();
+                _lastCompleteEnumeration = result;
+                Debug.WriteLine($"[Audio] Total sessions: {result.Count}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Enumerate error: {ex.Message}");
+                return new List<AudioSessionInfo>(_lastCompleteEnumeration);
+            }
+            finally
+            {
+                foreach (var previousDevice in obsoleteDevices)
+                {
+                    try { previousDevice.Dispose(); }
+                    catch (Exception ex) { Debug.WriteLine($"[Audio] Retired endpoint release failed: {ex.Message}"); }
+                }
+            }
         }
-        catch (Exception ex)
+
+        // Never invoke a subscriber while holding the enumeration lock.
+        foreach (var sessionId in removed)
         {
-            Debug.WriteLine($"[Audio] Enumerate error: {ex.Message}");
+            try { _onDestroyed?.Invoke(sessionId); }
+            catch (Exception ex) { Debug.WriteLine($"[Audio] Destroy callback error: {ex.Message}"); }
         }
 
         return result;
     }
 
-    private static string BuildControlKey(string deviceId, string sid, uint pid, int index, string displayName)
+    internal static string BuildControlKey(string deviceId, string sid, uint pid, int index)
     {
         if (!string.IsNullOrWhiteSpace(sid))
         {
             return $"{deviceId}|{sid}";
         }
 
-        if (pid != 0 || !string.IsNullOrWhiteSpace(displayName))
-        {
-            return $"{deviceId}|pid:{pid}|display:{displayName}";
-        }
-
-        return $"{deviceId}|idx:{index}";
+        return $"{deviceId}|pid:{pid}|idx:{index}";
     }
 
-    private IEnumerable<MMDevice> EnumerateCandidateDevices()
+    // Call only while holding _enumerationSync. Caller disposes retired
+    // devices AFTER retiring session wrappers that referred to them.
+    private List<MMDevice> ResolveCurrentScanDevices(
+        out MMDevice? multimediaDevice, out List<MMDevice> retiredDevices)
     {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        // Enumerate every active render endpoint, not only the three current defaults.
-        // Windows keeps per-app session volume per endpoint, so MiniMixer must see all of them.
-        MMDeviceCollection? endpoints = null;
-        try
-        {
-            endpoints = _enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active);
-        }
-        catch
-        {
-            // fall back to default-role endpoints below
-        }
-
-        if (endpoints != null)
-        {
-            foreach (var device in endpoints)
-            {
-                if (device == null || string.IsNullOrWhiteSpace(device.ID) || !seen.Add(device.ID))
-                {
-                    continue;
-                }
-
-                yield return device;
-            }
-        }
-
+        multimediaDevice = null;
+        var activeIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var active = new List<MMDevice>();
         foreach (var role in CandidateRoles)
         {
-            MMDevice? device = null;
+            MMDevice? candidate = null;
             try
             {
-                device = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, role);
-            }
-            catch
-            {
-                // ignore unavailable endpoint for this role
-            }
-
-            if (device == null || string.IsNullOrWhiteSpace(device.ID) || !seen.Add(device.ID))
-            {
-                continue;
-            }
-
-            yield return device;
-        }
-
-        if (seen.Count == 0)
-        {
-            yield return _device;
-        }
-    }
-
-    private HashSet<string> GetDefaultRenderDeviceIds()
-    {
-        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var role in CandidateRoles)
-        {
-            try
-            {
-                var device = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, role);
-                if (device != null && !string.IsNullOrWhiteSpace(device.ID))
+                candidate = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, role);
+                var id = candidate.ID;
+                if (activeIds.Add(id))
                 {
-                    result.Add(device.ID);
+                    if (!_scanDevices.TryGetValue(id, out var existing))
+                    {
+                        existing = candidate;
+                        _scanDevices.Add(id, existing);
+                        candidate = null; // Ownership transferred to persistent scan cache.
+                    }
+                    active.Add(existing);
+                }
+                if (role == Role.Multimedia)
+                {
+                    _scanDevices.TryGetValue(id, out multimediaDevice);
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // best effort only
+                Debug.WriteLine($"[Audio] Current {role} render endpoint unavailable: {ex.Message}");
+            }
+            finally
+            {
+                // Includes duplicate Console/Multimedia/Communications wrappers.
+                candidate?.Dispose();
             }
         }
 
-        return result;
+        retiredDevices = new List<MMDevice>();
+        foreach (var pair in _scanDevices.ToArray())
+        {
+            if (activeIds.Contains(pair.Key)) continue;
+            _scanDevices.Remove(pair.Key);
+            retiredDevices.Add(pair.Value);
+        }
+        return active;
     }
 
-    private static string TryGetFriendlyName(MMDevice device)
-    {
-        try
-        {
-            return device.FriendlyName ?? string.Empty;
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
-
-    private static bool TryResolveProcessMetadata(uint pid, out string exePath, out string exeName, out string displayName, out string companyName, out string productName, out string originalFilename)
+    private static bool TryResolveProcessMetadata(uint pid, out string exePath, out string exeName, out string displayName)
     {
         exePath = string.Empty;
         exeName = string.Empty;
         displayName = string.Empty;
-        companyName = string.Empty;
-        productName = string.Empty;
-        originalFilename = string.Empty;
 
         var now = DateTime.UtcNow;
         lock (_processMetaLock)
@@ -242,9 +299,6 @@ public class NAudioSessionManager : IAudioSessionManager
                 exePath = cached.ExePath;
                 exeName = cached.ExeName;
                 displayName = cached.DisplayName;
-                companyName = cached.CompanyName;
-                productName = cached.ProductName;
-                originalFilename = cached.OriginalFilename;
                 return true;
             }
         }
@@ -252,9 +306,6 @@ public class NAudioSessionManager : IAudioSessionManager
         var resolvedPath = string.Empty;
         var resolvedExeName = string.Empty;
         var resolvedDisplay = string.Empty;
-        var resolvedCompany = string.Empty;
-        var resolvedProduct = string.Empty;
-        var resolvedOriginalFilename = string.Empty;
 
         try
         {
@@ -279,9 +330,6 @@ public class NAudioSessionManager : IAudioSessionManager
                 {
                     var fvi = FileVersionInfo.GetVersionInfo(resolvedPath);
                     resolvedDisplay = fvi.FileDescription ?? fvi.ProductName ?? string.Empty;
-                    resolvedCompany = fvi.CompanyName ?? string.Empty;
-                    resolvedProduct = fvi.ProductName ?? string.Empty;
-                    resolvedOriginalFilename = fvi.OriginalFilename ?? string.Empty;
                 }
                 catch
                 {
@@ -315,9 +363,6 @@ public class NAudioSessionManager : IAudioSessionManager
                 {
                     var fvi = FileVersionInfo.GetVersionInfo(resolvedPath);
                     resolvedDisplay = fvi.FileDescription ?? fvi.ProductName ?? string.Empty;
-                    resolvedCompany = fvi.CompanyName ?? resolvedCompany;
-                    resolvedProduct = fvi.ProductName ?? resolvedProduct;
-                    resolvedOriginalFilename = fvi.OriginalFilename ?? resolvedOriginalFilename;
                 }
                 catch
                 {
@@ -337,19 +382,13 @@ public class NAudioSessionManager : IAudioSessionManager
                 CapturedUtc = now,
                 ExePath = resolvedPath,
                 ExeName = resolvedExeName,
-                DisplayName = resolvedDisplay,
-                CompanyName = resolvedCompany,
-                ProductName = resolvedProduct,
-                OriginalFilename = resolvedOriginalFilename
+                DisplayName = resolvedDisplay
             };
         }
 
         exePath = resolvedPath;
         exeName = resolvedExeName;
         displayName = resolvedDisplay;
-        companyName = resolvedCompany;
-        productName = resolvedProduct;
-        originalFilename = resolvedOriginalFilename;
         return !string.IsNullOrWhiteSpace(exePath) || !string.IsNullOrWhiteSpace(exeName);
     }
 
@@ -390,7 +429,7 @@ public class NAudioSessionManager : IAudioSessionManager
         }
     }
 
-    private AudioSessionInfo? ExtractSessionInfo(AudioSessionControl session, string controlKey, string outputDeviceId, string outputDeviceName, bool isDefaultOutputDevice)
+    private AudioSessionInfo? ExtractSessionInfo(AudioSessionControl session, string controlKey)
     {
         try
         {
@@ -399,16 +438,13 @@ public class NAudioSessionManager : IAudioSessionManager
             uint pid = 0;
             var exePath = string.Empty;
             var exeName = string.Empty;
-            var companyName = string.Empty;
-            var productName = string.Empty;
-            var originalFilename = string.Empty;
             byte[]? iconBytes = null;
 
             var isSystemSound = false;
             if (session.IsSystemSoundsSession)
             {
                 isSystemSound = true;
-                displayName = "Lautstaerke";
+                displayName = "Systemklänge";
                 exeName = "SystemSound";
                 exePath = "__system_sound__";
             }
@@ -417,7 +453,7 @@ public class NAudioSessionManager : IAudioSessionManager
 
             if (string.IsNullOrWhiteSpace(exePath) && pid > 0)
             {
-                TryResolveProcessMetadata(pid, out exePath, out exeName, out var processDisplayName, out companyName, out productName, out originalFilename);
+                TryResolveProcessMetadata(pid, out exePath, out exeName, out var processDisplayName);
                 if (string.IsNullOrWhiteSpace(displayName))
                 {
                     displayName = processDisplayName;
@@ -485,24 +521,34 @@ public class NAudioSessionManager : IAudioSessionManager
                 exePath = displayName;
             }
 
+            // The NAudio volume wrapper is cached by its session owner.
+            // Keep it valid through manual volume/mute writes and release
+            // only when the corresponding session snapshot is replaced.
+            var sessionVolume = session.SimpleAudioVolume;
+            // Reuse this scan's existing AudioSessionControl, without a second
+            // enumerator, sampling loop, or audio write. Unsupported meters are unknown.
+            float? signalPeakLevel = null;
+            try
+            {
+                var peak = session.AudioMeterInformation.MasterPeakValue;
+                if (float.IsFinite(peak)) signalPeakLevel = Math.Clamp(peak, 0f, 1f);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Meter unavailable: {ex.Message}");
+            }
             return new AudioSessionInfo
             {
                 SessionIdentifier = controlKey,
+                SignalPeakLevel = signalPeakLevel,
                 ProcessId = pid,
-                Volume = session.SimpleAudioVolume.Volume,
-                IsMuted = session.SimpleAudioVolume.Mute,
+                Volume = sessionVolume.Volume,
+                IsMuted = sessionVolume.Mute,
                 DisplayName = displayName,
-                AppIdentityKey = AppIdentity.CreateKey(exePath, exeName, displayName, companyName, productName, originalFilename),
                 ExePath = exePath,
                 ExeName = exeName,
-                CompanyName = companyName,
-                ProductName = productName,
-                OriginalFilename = originalFilename,
                 IconBytes = iconBytes,
-                IsSystemSound = isSystemSound,
-                OutputDeviceId = outputDeviceId,
-                OutputDeviceName = outputDeviceName,
-                IsDefaultOutputDevice = isDefaultOutputDevice
+                IsSystemSound = isSystemSound
             };
         }
         catch (Exception ex)
@@ -674,102 +720,214 @@ public class NAudioSessionManager : IAudioSessionManager
         return ReadFromHive(Registry.LocalMachine, exeName);
     }
 
-    public void SetVolume(string sessionIdentifier, float volume)
+    // The selected endpoint is revalidated before every master write.
+    // A device switch must never apply stale UI commands to a different
+    // physical output or accidentally target System Sounds.
+    private void ApplyMasterControl(string controlKey, Action<AudioEndpointVolume> update)
     {
         try
         {
-            if (_sessions.TryGetValue(sessionIdentifier, out var session))
-            {
-                session.SimpleAudioVolume.Volume = Math.Clamp(volume, 0f, 1f);
-            }
+            using var current = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+            if (!string.Equals(controlKey, BuildMasterControlKey(current.ID),
+                    StringComparison.OrdinalIgnoreCase))
+                return;
+            // MMDevice owns and disposes its cached AudioEndpointVolume.
+            // Never dispose a child twice while its endpoint is still alive.
+            update(current.AudioEndpointVolume);
         }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[Audio] SetVolume error: {ex.Message}");
+            Debug.WriteLine($"[Audio] Master control failed closed: {ex.Message}");
         }
     }
 
-    public void SetMute(string sessionIdentifier, bool mute)
+    public void SetVolume(string sessionIdentifier, float volume) =>
+        _ = TrySetVolume(sessionIdentifier, volume);
+
+    public bool TrySetVolume(string sessionIdentifier, float volume)
     {
-        try
+        var requested = Math.Clamp(volume, 0f, 1f);
+        if (sessionIdentifier.StartsWith(MasterControlPrefix, StringComparison.OrdinalIgnoreCase))
         {
-            if (_sessions.TryGetValue(sessionIdentifier, out var session))
+            try
             {
-                session.SimpleAudioVolume.Mute = mute;
+                using var current = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                if (!string.Equals(sessionIdentifier, BuildMasterControlKey(current.ID),
+                        StringComparison.OrdinalIgnoreCase)) return false;
+                current.AudioEndpointVolume.MasterVolumeLevelScalar = requested;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Master SetVolume error: {ex.Message}");
+                return false;
             }
         }
-        catch (Exception ex)
+        lock (_enumerationSync)
         {
-            Debug.WriteLine($"[Audio] SetMute error: {ex.Message}");
+            try
+            {
+                if (!_sessions.TryGet(sessionIdentifier, out var session) || session == null)
+                    return false;
+                session.SimpleAudioVolume.Volume = requested;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] SetVolume error: {ex.Message}");
+                return false;
+            }
+        }
+    }
+
+    public void SetMute(string sessionIdentifier, bool mute) =>
+        _ = TrySetMute(sessionIdentifier, mute);
+
+    public bool TrySetMute(string sessionIdentifier, bool mute)
+    {
+        if (sessionIdentifier.StartsWith(MasterControlPrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                using var current = _enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                if (!string.Equals(sessionIdentifier, BuildMasterControlKey(current.ID),
+                        StringComparison.OrdinalIgnoreCase)) return false;
+                current.AudioEndpointVolume.Mute = mute;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Master SetMute error: {ex.Message}");
+                return false;
+            }
+        }
+        lock (_enumerationSync)
+        {
+            try
+            {
+                if (!_sessions.TryGet(sessionIdentifier, out var session) || session == null)
+                    return false;
+                session.SimpleAudioVolume.Mute = mute;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] SetMute error: {ex.Message}");
+                return false;
+            }
         }
     }
 
     public void OnSessionCreated(Action<AudioSessionInfo> callback) { _onCreated = callback; }
     public void OnSessionDestroyed(Action<string> callback) { _onDestroyed = callback; }
 
+    // No second poll of the OS is needed: the same current role->ID
+    // identities drive both the snapshot and the monitor subscriptions.
+    // This method is called only while holding _enumerationSync.
+    private void SynchronizeMonitoringWithCurrentEndpoints(IReadOnlyList<MMDevice> devices)
+    {
+        var activeIds = new HashSet<string>(
+            devices.Select(d => d.ID), StringComparer.OrdinalIgnoreCase);
+        var retiredIds = _monitoredDevices.Keys
+            .Where(id => !activeIds.Contains(id)).ToArray();
+        var addedIds = activeIds
+            .Where(id => !_monitoredDevices.ContainsKey(id)).ToArray();
+        if (retiredIds.Length == 0 && addedIds.Length == 0) return;
+
+        // Callbacks from the former default device must never be forwarded
+        // as newly created sessions on the replacement device.
+        System.Threading.Interlocked.Increment(ref _monitoringGeneration);
+        foreach (var id in retiredIds)
+        {
+            var former = _monitoredDevices[id];
+            _monitoredDevices.Remove(id);
+            try { former.AudioSessionManager.OnSessionCreated -= OnNewSessionCreated; }
+            catch (Exception ex) { Debug.WriteLine($"[Audio] Unsubscribe retired endpoint failed: {ex.Message}"); }
+            finally { former.Dispose(); }
+        }
+        foreach (var id in addedIds)
+        {
+            MMDevice? monitor = null;
+            try
+            {
+                // Distinct COM owner from the long-lived polling device.
+                // A removed endpoint may fail this lookup: fail closed and
+                // retry during the following normal poll.
+                monitor = _enumerator.GetDevice(id);
+                monitor.AudioSessionManager.OnSessionCreated += OnNewSessionCreated;
+                _monitoredDevices.Add(id, monitor);
+                monitor = null;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[Audio] Monitor registration failed for endpoint {id}: {ex.Message}");
+            }
+            finally { monitor?.Dispose(); }
+        }
+    }
+
     public void StartMonitoring()
     {
-        try
+        lock (_enumerationSync)
         {
-            foreach (var device in EnumerateCandidateDevices())
-            {
-                if (_monitoredDevices.ContainsKey(device.ID))
-                {
-                    continue;
-                }
-
-                device.AudioSessionManager.OnSessionCreated += OnNewSessionCreated;
-                _monitoredDevices[device.ID] = device;
-            }
-        }
-        catch
-        {
-            // ignore monitor start failures
+            _monitoringActive = true;
+            // Initialize normally runs an initial enumeration before this.
+            // If not, the next normal poll will populate and subscribe.
+            SynchronizeMonitoringWithCurrentEndpoints(_scanDevices.Values.ToArray());
         }
     }
 
     public void StopMonitoring()
     {
-        try
+        lock (_enumerationSync)
         {
-            foreach (var pair in _monitoredDevices)
+            _monitoringActive = false;
+            System.Threading.Interlocked.Increment(ref _monitoringGeneration);
+            foreach (var device in _monitoredDevices.Values)
             {
-                try
-                {
-                    pair.Value.AudioSessionManager.OnSessionCreated -= OnNewSessionCreated;
-                }
-                catch
-                {
-                    // ignore per-device unsubscribe failures
-                }
+                try { device.AudioSessionManager.OnSessionCreated -= OnNewSessionCreated; }
+                catch (Exception ex) { Debug.WriteLine($"[Audio] Monitor stop failed: {ex.Message}"); }
+                finally { device.Dispose(); }
             }
-        }
-        catch
-        {
-            // ignore monitor stop failures
-        }
-        finally
-        {
             _monitoredDevices.Clear();
+
+            // Only command-free shutdown may withdraw all remaining snapshot
+            // controls and endpoint objects. No callback runs inside this lock.
+            _sessions.Replace(new Dictionary<string, AudioSessionControl>(), out _, out var retiredControls);
+            foreach (var retired in retiredControls)
+            {
+                try { retired.SimpleAudioVolume.Dispose(); retired.Dispose(); }
+                catch { try { retired.Dispose(); } catch { } }
+            }
+            foreach (var device in _scanDevices.Values)
+            {
+                try { device.Dispose(); } catch { }
+            }
+            _scanDevices.Clear();
         }
     }
 
     private void OnNewSessionCreated(object sender, object newSession)
     {
-        // Brief delay to let the session fully initialize before enumerating
+        var generation = System.Threading.Volatile.Read(ref _monitoringGeneration);
+        // The NAudio notification is only a scan trigger. Its callback does not identify
+        // a published endpoint-scoped key; the last enumerated session may be unrelated.
         System.Threading.Tasks.Task.Delay(140).ContinueWith(_ =>
         {
+            if (generation != System.Threading.Volatile.Read(ref _monitoringGeneration)) return;
             try
             {
-                var sessions = EnumerateSessions();
-                if (sessions.Count > 0)
+                EnumerateSessions(out var addedSessions);
+                foreach (var session in addedSessions)
                 {
-                    _onCreated?.Invoke(sessions[sessions.Count - 1]);
+                    if (generation != System.Threading.Volatile.Read(ref _monitoringGeneration)) break;
+                    try { _onCreated?.Invoke(session); }
+                    catch (Exception ex) { Debug.WriteLine($"[Audio] Create callback error: {ex.Message}"); }
                 }
             }
-            catch
+            catch (Exception ex)
             {
-                // ignore callback failures
+                Debug.WriteLine($"[Audio] Create scan error: {ex.Message}");
             }
         });
     }

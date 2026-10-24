@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
@@ -22,7 +22,7 @@ using MiniMixerOverlay.Core.Models;
 
 namespace MiniMixerOverlay.App
 {
-    public static class Program
+    public static partial class Program
     {
         private static Window? _mainWin;
         private static Window? _settingsWin;
@@ -54,17 +54,21 @@ namespace MiniMixerOverlay.App
         private static Mutex? _singleInstanceMutex;
         private static EventWaitHandle? _singleInstanceShowEvent;
         private static RegisteredWaitHandle? _singleInstanceShowWaitRegistration;
+        private static HwndSource? _toggleHotkeySource;
+        private static bool _toggleHotkeyRegistered;
+        private static string _toggleHotkeyError = string.Empty;
         private static bool _persistPending;
         private static bool _startupInitializationQueued;
+        private static string? _isolatedReviewRoot;
 
         private static bool _isRefreshing;
         private static bool _isUserInteracting;
         private static bool _isSessionRefreshFromUiPoll;
         private static bool _bringToFrontOnHover = true;
-        private static bool _userAlwaysOnTop = true;
-        private static bool _windowsThemeWatchInstalled;
         private static bool _cornerRevealEnabled = true;
         private static bool _cornerRevealVisible = true;
+        // Explicit minus-collapse must not immediately reopen because the
+        // cursor is still over the former main-window rectangle.
         private static bool _edgeDockEnabled;
         private static bool _edgeDockActive;
         private static string _edgeDockSide = "right";
@@ -72,21 +76,19 @@ namespace MiniMixerOverlay.App
         private static int _edgeDockRevealZoneWidth = 72;
         private static bool _edgeDockExpanded = true;
         private static bool _autoApplyToAllNewApps = true;
-        private static int _autoVolumePercent = GuardDefaults.AutoVolumePercent;
-        private static string _overlayMode = OverlayModeDesktop;
+        private static int _autoVolumePercent = 5;
+        private static int _autoLimitMaxInstallAgeDays = 7;
+        private static string _overlayMode = OverlayModeGameHook;
         private static string _uiLanguage = UiLanguageGerman;
         private static string _gameHookAssetsPath = DefaultGameHookAssetsRelativePath;
         private static string _gameHookTargetWindowTitle = string.Empty;
         private static bool _gameHookForwardInput;
         private static bool _gameHookAutoStartRuntime = true;
+        // Explicit safe live diagnostic mode: attach only the existing WPF
+        // IPC host to an independently pre-authorized graphics hook.
+        private static bool _gameHookIpcOnlyTestRun;
+        private static bool _gameHookIpcSphereInputTest;
         private static bool _gameHookInputInterceptEnabled;
-        private static bool _gameHookEffectiveInputInterceptEnabled;
-        private static GameHookInputState _gameHookInputState = GameHookInputState.Unknown;
-        private static GameHookInputState _gameHookInputCandidate = GameHookInputState.Unknown;
-        private static DateTime _gameHookInputCandidateSinceUtc = DateTime.MinValue;
-        private static string _gameHookInputLastLogFingerprint = string.Empty;
-        private static bool _gameHookCanInteract = true;
-        private static readonly HashSet<IntPtr> _clickThroughWindows = new();
         private static readonly HashSet<uint> _gameHookInjectedProcessIds = new();
         private static readonly Dictionary<uint, DateTime> _gameHookRetryAfterUtcByPid = new();
         private static string _gameHookLastForegroundTitle = string.Empty;
@@ -105,6 +107,7 @@ namespace MiniMixerOverlay.App
         private static int _refreshIntervalMs = 1800;
         private static int _visibleApps = 5;
         private static bool _cornerHintShowDot = true;
+        private static int _cornerHintTransparencyPercent;
         private static bool _cornerHintShowValue = true;
         private static string _cornerHintValueColor = "Auto";
         private static bool _cornerHintUseCustomValueColor;
@@ -132,12 +135,13 @@ namespace MiniMixerOverlay.App
 
         private const double CardRowPitch = 68;
         private const double CardVisualHeight = 62;
+        private const double DesktopHeaderHeight = 42;
+        private const double DesktopStatusHeight = 28;
         private const int CornerRevealTickMs = 80;
-        private const int GameHookUiCursorStableMs = 320;
-        private const int GameHookCapturedStableMs = 80;
         private const int CornerRevealHotZonePx = 34;
+        // The sphere uses its own tight hit zone, never the desktop dock reveal slider.
+        private const double CornerHintHoverPadding = 7;
         private const int CornerRevealHoldMs = 1600;
-        private const double CornerRevealHiddenOpacity = 0.24;
         private const int EdgeDockRevealZonePx = 5;
         private const int EdgeDockSnapDistancePx = 26;
         private const int EdgeDockHoldMs = 1400;
@@ -159,18 +163,16 @@ namespace MiniMixerOverlay.App
             UiLanguageGerman,
             UiLanguageEnglish
         };
-        private const string DefaultGameHookAssetsRelativePath = @"goverlay-master\goverlay-master\game-overlay\prebuilt";
+        private const string DefaultGameHookAssetsRelativePath = @"native\GameHook\candidate";
+        private const string PreviousGameHookAssetsRelativePath = @"native\GameHook\prebuilt";
+        private const string LegacyGameHookAssetsRelativePath = @"goverlay-master\goverlay-master\game-overlay\prebuilt";
         private const double CornerHintDiameter = 24;
         private const double CornerHintInset = 7;
         private const int CornerHintVolumeCacheMs = 500;
-        private const double CornerHintHoverPadding = 7;
         private const int ForegroundPriorityWarmupMs = 2200;
         private const int ForegroundProbeThrottleMs = 160;
         private const int StartupFastRefreshDurationMs = 26000;
         private const int StartupFastRefreshIntervalMs = 650;
-        private const long RuntimeErrorLogMaxBytes = 1L * 1024 * 1024;
-        private const long GameHookInputLogMaxBytes = 2L * 1024 * 1024;
-        private const int DiagnosticLogArchiveCount = 2;
         private const string SingleInstanceMutexName = @"Local\MiniMixerOverlay.App.Singleton";
         private const string SingleInstanceShowEventName = @"Local\MiniMixerOverlay.App.ShowMain";
         private static readonly double _cardH = CardRowPitch;
@@ -222,13 +224,6 @@ namespace MiniMixerOverlay.App
         private static Color _activeGlassAccent = Color.FromRgb(0, 212, 255);
         private static bool _windowsAccentUnavailable;
 
-        private enum GameHookInputState
-        {
-            Unknown,
-            GameplayCaptured,
-            GameUiCursor
-        }
-
         private enum ScreenCorner
         {
             TopLeft,
@@ -237,15 +232,87 @@ namespace MiniMixerOverlay.App
             BottomRight
         }
 
+        // Validate before mutex, tray, HWND and SourceInitialized/native IPC.
+        // Review mode selects paths for the existing canonical stores only.
+        private static bool TryConfigureIsolatedReviewProfile(string[] args)
+        {
+            _isolatedReviewRoot = null;
+            const string prefix = "--isolated-review-profile=";
+            var reviewArgs = args.Skip(1)
+                .Where(arg => arg.StartsWith("--isolated-review-profile", StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            if (reviewArgs.Length == 0) return true;
+            if (reviewArgs.Length != 1 ||
+                !reviewArgs[0].StartsWith(prefix, StringComparison.OrdinalIgnoreCase) ||
+                args.Skip(1).Any(arg =>
+                    string.Equals(arg, "--native-hook-preview", StringComparison.OrdinalIgnoreCase) ||
+                    arg.StartsWith("--graphics-ipc-", StringComparison.OrdinalIgnoreCase)))
+                return false;
+
+            try
+            {
+                var requested = reviewArgs[0][prefix.Length..];
+                if (!Path.IsPathFullyQualified(requested)) return false;
+                var path = Path.GetFullPath(requested);
+                var roaming = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData));
+                var local = Path.GetFullPath(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData));
+                static bool Inside(string path, string parent) =>
+                    path.Equals(parent, StringComparison.OrdinalIgnoreCase) ||
+                    path.StartsWith(parent.TrimEnd(Path.DirectorySeparatorChar) +
+                        Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+                // A uniquely named Temp subfolder is safe; the actual product
+                // profile roots are not valid review destinations.
+                if (Inside(path, Path.Combine(roaming, "MiniMixerOverlay")) ||
+                    Inside(path, Path.Combine(local, "MiniMixerOverlay")) ||
+                    path.Equals(roaming, StringComparison.OrdinalIgnoreCase) ||
+                    path.Equals(local, StringComparison.OrdinalIgnoreCase) ||
+                    !Directory.Exists(path) ||
+                    !File.Exists(Path.Combine(path, "review.sentinel")) ||
+                    !File.Exists(Path.Combine(path, "settings.json")))
+                    return false;
+                // Do not follow junctions/symlinks into the real user profile.
+                for (var folder = new DirectoryInfo(path); folder != null; folder = folder.Parent)
+                {
+                    if ((folder.Attributes & FileAttributes.ReparsePoint) != 0)
+                        return false;
+                }
+                foreach (var target in new[] {
+                    "review.sentinel", "settings.json", "rules.json",
+                    Path.Combine("logs", "guard.log"), Path.Combine("logs", "runtime-errors.log"),
+                    "logs" })
+                {
+                    var candidate = Path.Combine(path, target);
+                    if ((File.Exists(candidate) || Directory.Exists(candidate)) &&
+                        (File.GetAttributes(candidate) & FileAttributes.ReparsePoint) != 0)
+                        return false;
+                }
+                _isolatedReviewRoot = path;
+                return true;
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
         [STAThread]
         public static void Main()
         {
+            if (!TryConfigureIsolatedReviewProfile(Environment.GetCommandLineArgs()))
+            {
+                Environment.ExitCode = 2;
+                return;
+            }
+            _gameHookIpcOnlyTestRun = Array.Exists(Environment.GetCommandLineArgs(),
+                arg => string.Equals(arg, "--graphics-ipc-only", StringComparison.OrdinalIgnoreCase));
+            _gameHookIpcSphereInputTest = _gameHookIpcOnlyTestRun &&
+                Array.Exists(Environment.GetCommandLineArgs(),
+                    arg => string.Equals(arg, "--graphics-ipc-enable-sphere-input",
+                                         StringComparison.OrdinalIgnoreCase));
             if (!TryAcquireSingleInstance())
             {
                 return;
             }
-
-            CleanupLegacyDiagnosticLogs();
 
             var app = new Application
             {
@@ -292,6 +359,7 @@ namespace MiniMixerOverlay.App
             _mainWin.SourceInitialized += (_, _) =>
             {
                 EnableNoActivateWindowBehavior(_mainWin);
+                InitializeToggleHotkey();
                 SyncGameHookRuntimeState();
             };
             _mainWin.ContentRendered += (_, _) =>
@@ -313,18 +381,16 @@ namespace MiniMixerOverlay.App
                 }
 
                 _mainWin.WindowState = WindowState.Normal;
-                PersistCurrentState();
-                _mainWin.Hide();
-                HideCornerHintWindow();
+                MinimizeMainOverlay();
             };
             _mainWin.MouseEnter += (_, _) =>
             {
-                // Capture the previously active audio app before the overlay can take focus.
+                // Record the foreground audio process before overlay interaction.
                 CaptureForegroundAudioContext();
                 _cornerRevealVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(CornerRevealHoldMs);
                 if (_bringToFrontOnHover)
                 {
-                    // Showing the overlay must not steal foreground focus on hover.
+                    // Raising the overlay should not steal the foreground audio process.
                     BringMainWindowToFront(activate: false);
                 }
             };
@@ -339,7 +405,6 @@ namespace MiniMixerOverlay.App
                 }
                 CloseActiveAppPopup();
                 CloseCornerHintWindow();
-                StopWindowsThemeWatch();
 
                 if (!app.Dispatcher.HasShutdownStarted)
                 {
@@ -369,7 +434,6 @@ namespace MiniMixerOverlay.App
                 StartAudio();
                 StartRefreshLoop();
                 StartCornerRevealLoop();
-                StartWindowsThemeWatch();
                 StartGameHookAutoDetectLoop();
             }), DispatcherPriority.ApplicationIdle);
         }
@@ -396,144 +460,14 @@ namespace MiniMixerOverlay.App
             };
         }
 
-        private static void CleanupLegacyDiagnosticLogs()
-        {
-            // v10/v11 wrote guard.log on every refresh under Roaming AppData. Those files are
-            // diagnostic-only and could grow into gigabytes, so remove only the known legacy
-            // guard logs. rules.json and settings.json are deliberately untouched.
-            try
-            {
-                var legacyLogDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-                    "MiniMixerOverlay",
-                    "logs");
-
-                foreach (var name in new[] { "guard.log", "guard.log.1", "guard.log.2", "guard.1.log", "guard.2.log" })
-                {
-                    var path = Path.Combine(legacyLogDir, name);
-                    if (File.Exists(path))
-                    {
-                        File.Delete(path);
-                    }
-                }
-
-                if (Directory.Exists(legacyLogDir) && !Directory.EnumerateFileSystemEntries(legacyLogDir).Any())
-                {
-                    Directory.Delete(legacyLogDir, recursive: false);
-                }
-            }
-            catch
-            {
-                // Cleanup must never block application startup.
-            }
-
-            // If an older diagnostic file in LocalAppData is already far above the new cap,
-            // discard it instead of rotating a multi-gigabyte archive on the next write.
-            try
-            {
-                var localLogDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "MiniMixerOverlay",
-                    "logs");
-                DeleteIfGrosslyOversized(Path.Combine(localLogDir, "runtime-errors.log"), RuntimeErrorLogMaxBytes);
-                DeleteIfGrosslyOversized(Path.Combine(localLogDir, "gamehook-input.log"), GameHookInputLogMaxBytes);
-            }
-            catch
-            {
-                // Best-effort maintenance only.
-            }
-        }
-
-        private static void DeleteIfGrosslyOversized(string path, long maxBytes)
-        {
-            try
-            {
-                if (File.Exists(path) && new FileInfo(path).Length > maxBytes * 2)
-                {
-                    File.Delete(path);
-                }
-            }
-            catch
-            {
-                // Best-effort maintenance only.
-            }
-        }
-
-        private static void AppendBoundedLog(string path, string text, long maxBytes, int archiveCount)
-        {
-            try
-            {
-                var directory = Path.GetDirectoryName(path);
-                if (!string.IsNullOrWhiteSpace(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-
-                var incomingBytes = Encoding.UTF8.GetByteCount(text);
-                var currentBytes = File.Exists(path) ? new FileInfo(path).Length : 0L;
-                if (currentBytes + incomingBytes > maxBytes)
-                {
-                    RotateLog(path, maxBytes, archiveCount);
-                }
-
-                File.AppendAllText(path, text, Encoding.UTF8);
-            }
-            catch
-            {
-                // Diagnostics must never affect runtime behavior.
-            }
-        }
-
-        private static void RotateLog(string path, long maxBytes, int archiveCount)
-        {
-            if (archiveCount <= 0)
-            {
-                if (File.Exists(path))
-                {
-                    File.Delete(path);
-                }
-                return;
-            }
-
-            var oldest = $"{path}.{archiveCount}";
-            if (File.Exists(oldest))
-            {
-                File.Delete(oldest);
-            }
-
-            for (var i = archiveCount - 1; i >= 1; i--)
-            {
-                var source = $"{path}.{i}";
-                var destination = $"{path}.{i + 1}";
-                if (File.Exists(source))
-                {
-                    File.Move(source, destination, overwrite: true);
-                }
-            }
-
-            if (File.Exists(path))
-            {
-                // A pre-v12 file may already be much larger than the configured cap. Do not
-                // preserve a huge archive; only rotate reasonably sized files.
-                if (new FileInfo(path).Length <= maxBytes * 2)
-                {
-                    File.Move(path, $"{path}.1", overwrite: true);
-                }
-                else
-                {
-                    File.Delete(path);
-                }
-            }
-        }
-
         private static void LogUnhandledException(string source, Exception? ex, string? details = null)
         {
             try
             {
-                var logDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "MiniMixerOverlay",
-                    "logs");
+                var logDir = _isolatedReviewRoot == null
+                    ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "MiniMixerOverlay", "logs")
+                    : Path.Combine(_isolatedReviewRoot, "logs");
                 Directory.CreateDirectory(logDir);
 
                 var logFile = Path.Combine(logDir, "runtime-errors.log");
@@ -551,7 +485,7 @@ namespace MiniMixerOverlay.App
                 }
                 sb.AppendLine();
 
-                AppendBoundedLog(logFile, sb.ToString(), RuntimeErrorLogMaxBytes, DiagnosticLogArchiveCount);
+                File.AppendAllText(logFile, sb.ToString());
             }
             catch
             {
@@ -562,9 +496,9 @@ namespace MiniMixerOverlay.App
         private static Grid BuildMainLayout(Application app)
         {
             var grid = new Grid();
-            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(42) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(DesktopHeaderHeight) });
             grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(28) });
+            grid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(DesktopStatusHeight) });
             _appListRowDefinition = grid.RowDefinitions[1];
 
             var header = BuildHeader(app);
@@ -684,7 +618,6 @@ namespace MiniMixerOverlay.App
                     _lastWindowLeft = _mainWin.Left;
                     _lastWindowTop = _mainWin.Top;
                     RepositionSettingsWindow();
-                    QueuePersistCurrentState();
                 }
             };
 
@@ -716,9 +649,7 @@ namespace MiniMixerOverlay.App
             {
                 if (_mainWin != null)
                 {
-                    PersistCurrentState();
-                    _mainWin.Hide();
-                    HideCornerHintWindow();
+                    MinimizeMainOverlay();
                 }
             };
             btns.Children.Add(btnMin);
@@ -803,61 +734,6 @@ namespace MiniMixerOverlay.App
             }
         }
 
-        private static System.Drawing.Icon? LoadTrayIcon()
-        {
-            // Primary source: embedded icon. This is independent of the current working
-            // directory and survives single-file publishing and normal installation.
-            try
-            {
-                var assembly = typeof(Program).Assembly;
-                using var stream = assembly.GetManifestResourceStream("MiniMixerOverlay.App.AppIcon.ico");
-                if (stream != null)
-                {
-                    using var embedded = new System.Drawing.Icon(stream);
-                    return (System.Drawing.Icon)embedded.Clone();
-                }
-            }
-            catch
-            {
-                // Fall through to executable/external fallbacks.
-            }
-
-            // The application icon is also embedded into the executable via <ApplicationIcon>.
-            // Extracting it gives us a robust second source on Windows.
-            try
-            {
-                var exePath = GetCurrentExecutablePath();
-                if (!string.IsNullOrWhiteSpace(exePath) && File.Exists(exePath))
-                {
-                    var associated = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
-                    if (associated != null)
-                    {
-                        return associated;
-                    }
-                }
-            }
-            catch
-            {
-                // Fall through to the external compatibility copy.
-            }
-
-            try
-            {
-                var externalPath = Path.Combine(AppContext.BaseDirectory, "AppIcon.ico");
-                if (File.Exists(externalPath))
-                {
-                    using var external = new System.Drawing.Icon(externalPath);
-                    return (System.Drawing.Icon)external.Clone();
-                }
-            }
-            catch
-            {
-                // No usable tray icon source.
-            }
-
-            return null;
-        }
-
         private static void InitializeTrayIcon(Application app)
         {
             if (_trayIcon != null)
@@ -867,7 +743,35 @@ namespace MiniMixerOverlay.App
 
             try
             {
-                var icon = LoadTrayIcon();
+                var trayIconPath = Path.Combine(AppContext.BaseDirectory, "AppIcon.ico");
+                if (!File.Exists(trayIconPath))
+                {
+                    trayIconPath = Path.Combine(AppContext.BaseDirectory, "Logo.png");
+                }
+
+                System.Drawing.Icon? icon = null;
+                if (File.Exists(trayIconPath) && trayIconPath.EndsWith(".ico", StringComparison.OrdinalIgnoreCase))
+                {
+                    icon = new System.Drawing.Icon(trayIconPath);
+                }
+                else if (File.Exists(trayIconPath))
+                {
+                    var exePath = GetCurrentExecutablePath();
+                    if (!string.IsNullOrWhiteSpace(exePath))
+                    {
+                        icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                    }
+                }
+
+                if (icon == null)
+                {
+                    var exePath = GetCurrentExecutablePath();
+                    if (!string.IsNullOrWhiteSpace(exePath))
+                    {
+                        icon = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
+                    }
+                }
+
                 if (icon == null)
                 {
                     return;
@@ -897,34 +801,38 @@ namespace MiniMixerOverlay.App
                         ShowSettings();
                     });
                 });
-                var exitItem = new Forms.ToolStripMenuItem(Ui("Beenden", "Exit"), null, (_, _) =>
+                _trayExitItem = new Forms.ToolStripMenuItem(Ui("Beenden", "Exit"), null, (_, _) =>
                 {
                     _mainWin?.Dispatcher.BeginInvoke(() =>
                     {
-                        if (_mainWin != null)
-                        {
-                            _mainWin.Close();
-                            return;
-                        }
-
-                        if (!app.Dispatcher.HasShutdownStarted)
-                        {
-                            app.Shutdown();
-                        }
+                        app.Shutdown();
                     });
                 });
 
                 menu.Items.Add(_trayToggleItem);
                 menu.Items.Add(_traySettingsItem);
                 menu.Items.Add(new Forms.ToolStripSeparator());
-                menu.Items.Add(exitItem);
+                menu.Items.Add(_trayExitItem);
+
                 _trayIcon.ContextMenuStrip = menu;
                 _trayIcon.DoubleClick += (_, _) => _mainWin?.Dispatcher.BeginInvoke(ToggleMainWindowVisibility);
+                ApplyTrayLanguageTexts();
             }
             catch
             {
-                DisposeTrayIcon();
+                // ignore tray init problems
             }
+        }
+
+        private static void MinimizeMainOverlay()
+        {
+            if (_mainWin == null) return;
+
+            PersistCurrentState();
+            // Minus and automatic hover-out share the same collapse transition.
+            _cornerRevealVisibleUntilUtc = DateTime.MinValue;
+            _isUserInteracting = false;
+            ApplyCornerRevealVisualState(false);
         }
 
         private static void ToggleMainWindowVisibility()
@@ -934,18 +842,99 @@ namespace MiniMixerOverlay.App
                 return;
             }
 
-            if (_mainWin.IsVisible)
+            if (_cornerRevealVisible && _mainWin.IsVisible)
             {
-                PersistCurrentState();
-                _mainWin.Hide();
-                HideCornerHintWindow();
+                MinimizeMainOverlay();
                 return;
             }
 
-            _mainWin.Show();
             ApplyOverlayModeRuntimeState();
+            _cornerRevealVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(CornerRevealHoldMs);
+            ApplyCornerRevealVisualState(true);
             RestoreDockPositionIfEnabled(expand: true);
-            BringMainWindowToFront();
+            BringMainWindowToFront(activate: false);
+            UpdateCornerHintWindow();
+        }
+
+        // Opt-in keyboard shortcut shares the exact tray-toggle command path.
+        // Windows owns shortcut arbitration; a conflict is visible, never silently overridden.
+        private const int ToggleHotkeyId = 0x4D31;
+        private const int WmHotkey = 0x0312;
+        private const uint HotkeyCtrlAltNoRepeat = 0x4003;
+
+        private static uint ResolveToggleHotkeyKey(string? key) => key?.ToUpperInvariant() switch
+        {
+            "M" => 0x4D,
+            "O" => 0x4F,
+            "F9" => 0x78,
+            "F10" => 0x79,
+            _ => 0
+        };
+
+        private static void InitializeToggleHotkey()
+        {
+            if (_mainWin == null) return;
+            var hwnd = new WindowInteropHelper(_mainWin).Handle;
+            if (hwnd == IntPtr.Zero) return;
+            _toggleHotkeySource = HwndSource.FromHwnd(hwnd);
+            _toggleHotkeySource?.AddHook(ToggleHotkeyWindowHook);
+            RebindToggleHotkey();
+        }
+
+        private static void RebindToggleHotkey()
+        {
+            var source = _toggleHotkeySource;
+            if (source == null) return;
+            if (_toggleHotkeyRegistered)
+            {
+                if (!UnregisterHotKey(source.Handle, ToggleHotkeyId))
+                {
+                    _toggleHotkeyError = Ui("Hotkey konnte nicht freigegeben werden", "Could not release hotkey") +
+                                         $" (Win32 {Marshal.GetLastWin32Error()})";
+                    return; // Never register a replacement while the previous key may still be owned.
+                }
+                _toggleHotkeyRegistered = false;
+            }
+            _toggleHotkeyError = string.Empty;
+            var enabled = _ctrl?.Settings.Ui.ToggleHotkeyEnabled == true;
+            if (!enabled) return;
+            var key = ResolveToggleHotkeyKey(_ctrl?.Settings.Ui.ToggleHotkeyKey);
+            if (key == 0)
+            {
+                _toggleHotkeyError = Ui("Ungültiger Hotkey", "Invalid hotkey");
+                return;
+            }
+            if (!RegisterHotKey(source.Handle, ToggleHotkeyId, HotkeyCtrlAltNoRepeat, key))
+            {
+                var error = Marshal.GetLastWin32Error();
+                _toggleHotkeyError = error == 1409 // ERROR_HOTKEY_ALREADY_REGISTERED
+                    ? Ui("Hotkey bereits belegt", "Hotkey already in use")
+                    : Ui("Hotkey-Registrierung fehlgeschlagen", "Hotkey registration failed") + $" (Win32 {error})";
+                return;
+            }
+            _toggleHotkeyRegistered = true;
+        }
+
+        private static IntPtr ToggleHotkeyWindowHook(
+            IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        {
+            if (msg == WmHotkey && wParam.ToInt64() == ToggleHotkeyId &&
+                _toggleHotkeyRegistered)
+            {
+                ToggleMainWindowVisibility();
+                handled = true;
+            }
+            return IntPtr.Zero;
+        }
+
+        private static void StopToggleHotkey()
+        {
+            if (_toggleHotkeySource == null) return;
+            if (_toggleHotkeyRegistered)
+                UnregisterHotKey(_toggleHotkeySource.Handle, ToggleHotkeyId);
+            _toggleHotkeyRegistered = false;
+            _toggleHotkeySource.RemoveHook(ToggleHotkeyWindowHook);
+            _toggleHotkeySource = null;
         }
 
         private static bool TryAcquireSingleInstance()
@@ -1052,7 +1041,10 @@ namespace MiniMixerOverlay.App
                 ShowWindow(hwnd, SwShowNoActivate);
                 SetWindowPos(
                     hwnd,
-                    HwndTopmost,
+                    // A second-instance activation must not silently promote
+                    // a user-selected non-topmost mixer into the topmost band.
+                    // HWND_TOP raises within the existing band.
+                    HwndTop,
                     0,
                     0,
                     0,
@@ -1150,16 +1142,24 @@ namespace MiniMixerOverlay.App
         {
             try
             {
+                // Preflight completed before Program.Main created any product runtime.
+                var reviewRoot = _isolatedReviewRoot;
                 var audio = new MiniMixerOverlay.Infrastructure.Audio.NAudioSessionManager();
-                var rules = new MiniMixerOverlay.Infrastructure.Persistence.JsonRuleStore();
-                var settings = new MiniMixerOverlay.Infrastructure.Persistence.JsonSettingsStore();
+                var rules = new MiniMixerOverlay.Infrastructure.Persistence.JsonRuleStore(
+                    reviewRoot == null ? null : Path.Combine(reviewRoot, "rules.json"));
+                var settings = new MiniMixerOverlay.Infrastructure.Persistence.JsonSettingsStore(
+                    reviewRoot == null ? null : Path.Combine(reviewRoot, "settings.json"));
                 settings.Load();
+                // Audio-write isolation is immutable at the controller boundary,
+                // independent of game classification and later UI configuration.
 
                 _autoApplyToAllNewApps = settings.Settings.Ui.AutoApplyToAllNewApps;
                 _autoVolumePercent = (int)Math.Clamp(settings.Settings.Ui.AutoVolumePercent, 1, 100);
+                _autoLimitMaxInstallAgeDays = (int)Math.Clamp(settings.Settings.Ui.AutoLimitMaxInstallAgeDays, 1, 365);
                 _overlayMode = NormalizeOverlayMode(settings.Settings.Ui.OverlayMode);
                 _uiLanguage = NormalizeUiLanguage(settings.Settings.Ui.Language);
-                _cornerHintShowDot = true;
+                _cornerHintShowDot = settings.Settings.Ui.CornerHintShowDot;
+                _cornerHintTransparencyPercent = Math.Clamp(settings.Settings.Ui.CornerHintTransparencyPercent, 0, 80);
                 _cornerHintShowValue = settings.Settings.Ui.CornerHintShowValue;
                 _cornerHintValueColor = NormalizeCornerHintValueColor(settings.Settings.Ui.CornerHintValueColor);
                 _cornerHintUseCustomValueColor = settings.Settings.Ui.CornerHintUseCustomValueColor;
@@ -1174,25 +1174,26 @@ namespace MiniMixerOverlay.App
                 _glassBorderColorHex = NormalizeHexColor(settings.Settings.Ui.GlassBorderColorHex, BlendColor(Color.FromRgb(188, 210, 230), _glassPalette["Cyan"], 0.60));
                 _glassBorderThickness = (int)Math.Clamp(settings.Settings.Ui.GlassBorderThickness, GlassBorderThicknessMin, GlassBorderThicknessMax);
                 _glassBorderSmudge = (int)Math.Clamp(settings.Settings.Ui.GlassBorderSmudge, GlassBorderSmudgeMin, GlassBorderSmudgeMax);
-                _gameHookAssetsPath = string.IsNullOrWhiteSpace(settings.Settings.GameHook?.AssetsPath)
-                    ? DefaultGameHookAssetsRelativePath
-                    : settings.Settings.GameHook.AssetsPath;
+                _gameHookAssetsPath = NormalizeHookAssetsPath(settings.Settings.GameHook?.AssetsPath);
                 _gameHookTargetWindowTitle = settings.Settings.GameHook?.TargetWindowTitle ?? string.Empty;
                 _gameHookForwardInput = settings.Settings.GameHook?.ForwardInputToOverlay ?? false;
                 _gameHookAutoStartRuntime = settings.Settings.GameHook?.AutoStartRuntime ?? true;
-                _userAlwaysOnTop = settings.Settings.Window.AlwaysOnTop;
                 _cornerHintManualPosition = settings.Settings.Window.CornerHintManualPosition;
                 _cornerHintManualX = settings.Settings.Window.CornerHintX ?? double.NaN;
                 _cornerHintManualY = settings.Settings.Window.CornerHintY ?? double.NaN;
-                NormalizeGlassColorOwnership();
                 _guard = new GuardEngine(
                     rules,
                     new SessionClassifier(),
                     _autoVolumePercent,
-                    _autoApplyToAllNewApps);
+                    _autoApplyToAllNewApps,
+                    _autoLimitMaxInstallAgeDays);
 
-                _ctrl = new MixerController(audio, _guard, new SessionClassifier(), rules, settings);
+                _ctrl = new MixerController(audio, _guard, new SessionClassifier(), rules, settings,
+                    guardLogFilePath: reviewRoot == null ? null :
+                        Path.Combine(reviewRoot, "logs", "guard.log"),
+                    allowAudioWrites: reviewRoot == null);
                 _ctrl.Initialize();
+                _ctrl.Settings.Ui.ShowOnlyActiveAudio = true;
                 _foregroundPriorityWarmupUntilUtc = DateTime.UtcNow.AddMilliseconds(ForegroundPriorityWarmupMs);
                 _lastForegroundProbeUtc = DateTime.MinValue;
                 _startupFastRefreshUntilUtc = DateTime.UtcNow.AddMilliseconds(StartupFastRefreshDurationMs);
@@ -1243,24 +1244,23 @@ namespace MiniMixerOverlay.App
                     var ws = _ctrl.Settings.Window;
                     _visibleApps = (int)Math.Clamp(_ctrl.Settings.Ui.VisibleApps, 0, 12);
                     _refreshIntervalMs = (int)Math.Clamp(_ctrl.Settings.Ui.RefreshIntervalMs, 700, 5000);
-                    _bringToFrontOnHover = true;
+                    _bringToFrontOnHover = _ctrl.Settings.Ui.BringToFrontOnHover;
                     _cornerRevealEnabled = _ctrl.Settings.Ui.CornerRevealEnabled;
                     _autoApplyToAllNewApps = _ctrl.Settings.Ui.AutoApplyToAllNewApps;
                     _autoVolumePercent = (int)Math.Clamp(_ctrl.Settings.Ui.AutoVolumePercent, 1, 100);
+                    _autoLimitMaxInstallAgeDays = (int)Math.Clamp(_ctrl.Settings.Ui.AutoLimitMaxInstallAgeDays, 1, 365);
                     _overlayMode = NormalizeOverlayMode(_ctrl.Settings.Ui.OverlayMode);
                     _uiLanguage = NormalizeUiLanguage(_ctrl.Settings.Ui.Language);
-                    _cornerHintShowDot = true;
+                    _cornerHintShowDot = _ctrl.Settings.Ui.CornerHintShowDot;
+                    _cornerHintTransparencyPercent = Math.Clamp(_ctrl.Settings.Ui.CornerHintTransparencyPercent, 0, 80);
                     _cornerHintShowValue = _ctrl.Settings.Ui.CornerHintShowValue;
                     _cornerHintValueColor = NormalizeCornerHintValueColor(_ctrl.Settings.Ui.CornerHintValueColor);
                     _cornerHintUseCustomValueColor = _ctrl.Settings.Ui.CornerHintUseCustomValueColor;
                     _cornerHintCustomValueColorHex = NormalizeHexColor(_ctrl.Settings.Ui.CornerHintCustomValueColorHex, Color.FromRgb(245, 252, 255));
-                    _gameHookAssetsPath = string.IsNullOrWhiteSpace(_ctrl.Settings.GameHook?.AssetsPath)
-                        ? DefaultGameHookAssetsRelativePath
-                        : _ctrl.Settings.GameHook.AssetsPath;
+                    _gameHookAssetsPath = NormalizeHookAssetsPath(_ctrl.Settings.GameHook?.AssetsPath);
                     _gameHookTargetWindowTitle = _ctrl.Settings.GameHook?.TargetWindowTitle ?? string.Empty;
                     _gameHookForwardInput = _ctrl.Settings.GameHook?.ForwardInputToOverlay ?? false;
                     _gameHookAutoStartRuntime = _ctrl.Settings.GameHook?.AutoStartRuntime ?? true;
-                    _userAlwaysOnTop = ws.AlwaysOnTop;
                     _cornerHintManualPosition = ws.CornerHintManualPosition;
                     _cornerHintManualX = ws.CornerHintX ?? double.NaN;
                     _cornerHintManualY = ws.CornerHintY ?? double.NaN;
@@ -1281,16 +1281,15 @@ namespace MiniMixerOverlay.App
                     _glassBorderColorHex = NormalizeHexColor(_ctrl.Settings.Ui.GlassBorderColorHex, BlendColor(Color.FromRgb(188, 210, 230), _glassPalette["Cyan"], 0.60));
                     _glassBorderThickness = (int)Math.Clamp(_ctrl.Settings.Ui.GlassBorderThickness, GlassBorderThicknessMin, GlassBorderThicknessMax);
                     _glassBorderSmudge = (int)Math.Clamp(_ctrl.Settings.Ui.GlassBorderSmudge, GlassBorderSmudgeMin, GlassBorderSmudgeMax);
-                    NormalizeGlassColorOwnership();
                     _cornerRevealVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(CornerRevealHoldMs);
-                    _guard?.Configure(_autoVolumePercent, _autoApplyToAllNewApps);
+                    _guard?.Configure(_autoVolumePercent, _autoApplyToAllNewApps, _autoLimitMaxInstallAgeDays);
 
                     if (ws.Width is >= 280 and <= 500)
                     {
                         _mainWin.Width = ws.Width;
                     }
 
-                    _mainWin.Topmost = IsDesktopOverlayMode() ? _userAlwaysOnTop : true;
+                    _mainWin.Topmost = ws.AlwaysOnTop;
                     RestoreSavedWindowPosition(ws.X, ws.Y);
                     _mainWin.Height = ComputeHeight(GetEffectiveVisibleApps());
                     ApplyAppListVisibilityState();
@@ -1330,6 +1329,7 @@ namespace MiniMixerOverlay.App
 
                 ApplyGlassTheme();
                 ApplyCornerRevealVisualState(true);
+                RebindToggleHotkey();
             }
             catch (Exception ex)
             {
@@ -1449,6 +1449,14 @@ namespace MiniMixerOverlay.App
 
         private static void StartGameHookAutoDetectLoop()
         {
+            // Auto-injection has no use in the normal WPF-only product.
+            // Avoid waking the Dispatcher every 1.25 seconds just to return.
+            if (!GameHookBridge.NativePreviewEnabled)
+            {
+                StopGameHookAutoDetectLoop();
+                return;
+            }
+
             _gameHookAutoDetectTimer ??= new DispatcherTimer
             {
                 Interval = TimeSpan.FromMilliseconds(1250)
@@ -1520,7 +1528,7 @@ namespace MiniMixerOverlay.App
 
             if (_ctrl == null)
             {
-                return true;
+                return false;
             }
 
             foreach (var entry in _ctrl.AppEntries)
@@ -1533,12 +1541,11 @@ namespace MiniMixerOverlay.App
                 var exeName = Path.GetFileNameWithoutExtension(entry.ExePath);
                 if (string.Equals(exeName, processName, StringComparison.OrdinalIgnoreCase))
                 {
-                    if (entry.Rule?.Classification == AppClassification.Game || entry.HasActiveAudio)
+                    if (entry.Rule?.Classification == AppClassification.Game &&
+                        entry.Sessions.Any(s => s.ProcessId == info.ProcessId))
                     {
                         return true;
                     }
-
-                    return true;
                 }
             }
 
@@ -1547,15 +1554,18 @@ namespace MiniMixerOverlay.App
 
         private static bool AreGameHookAssetsAvailable(string resolvedAssetsPath)
         {
-            var helperX86 = Path.Combine(resolvedAssetsPath, "injector_helper.exe");
-            var helperX64 = Path.Combine(resolvedAssetsPath, "injector_helper.x64.exe");
-            var dllX86 = Path.Combine(resolvedAssetsPath, "n_overlay.dll");
-            var dllX64 = Path.Combine(resolvedAssetsPath, "n_overlay.x64.dll");
-            return File.Exists(helperX86) && File.Exists(helperX64) && File.Exists(dllX86) && File.Exists(dllX64);
+            // Preview assets describe a native graphics implementation,
+            // not a ready-to-inject product backend.
+            return File.Exists(Path.Combine(resolvedAssetsPath, "MiniMixerLivePresent.x64.dll")) &&
+                   !File.Exists(Path.Combine(resolvedAssetsPath, "n_overlay.x64.dll"));
         }
 
         private static async void TryAutoInjectForegroundGame()
         {
+            // The archived GOverlay helper cannot be selected by either
+            // automatic or manual product paths. This native candidate is
+            // NOT yet an authorized unattended injector.
+            if (_gameHookIpcOnlyTestRun || !GameHookBridge.NativePreviewEnabled) return;
             if (IsDesktopOverlayMode())
             {
                 return;
@@ -1575,6 +1585,11 @@ namespace MiniMixerOverlay.App
             {
                 return;
             }
+
+            // Preview consent is limited to the named test game and own fixture.
+            // Manual attach is guarded again by the native loader.
+            if (!NativeGameHookLoader.IsApprovedPreviewProcessName(foreground.ProcessName))
+                return;
 
             _gameHookLastForegroundPid = foreground.ProcessId;
             _gameHookLastForegroundTitle = foreground.WindowTitle;
@@ -1612,9 +1627,12 @@ namespace MiniMixerOverlay.App
             _gameHookAutoInjectInProgress = true;
             SetGameHookStatus($"{Ui("Auto-Hook prueft", "Auto-hook checking")} {foreground.ProcessName} ...");
             GameHookInjectResult result;
+            var nativeGeneration = Interlocked.Read(ref _nativeRuntimeGeneration);
             try
             {
-                result = await Task.Run(() => GameHookBridge.InjectForegroundWindow(resolvedAssets));
+                result = await Task.Run(() => GameHookBridge.InjectQualifiedForegroundWindowGated(
+                    foreground, resolvedAssets,
+                    () => Interlocked.Read(ref _nativeRuntimeGeneration) == nativeGeneration));
             }
             catch (Exception ex)
             {
@@ -1630,6 +1648,7 @@ namespace MiniMixerOverlay.App
 
             if (IsDesktopOverlayMode() || _gameHookRuntime?.IsRunning != true)
             {
+                if (result.Success) _ = NativeGameHookLoader.RequestStop(result.ProcessId);
                 return;
             }
 
@@ -1637,7 +1656,7 @@ namespace MiniMixerOverlay.App
             {
                 _gameHookInjectedProcessIds.Add(result.ProcessId);
                 _gameHookRetryAfterUtcByPid.Remove(result.ProcessId);
-                SetGameHookStatus($"{Ui("Auto-Hook aktiv fur", "Auto-hook active for")} {foreground.ProcessName} (PID {result.ProcessId}).");
+                SetGameHookStatus($"{Ui("Native DLL geladen fur", "Auto-hook active for")} {foreground.ProcessName} (PID {result.ProcessId}).");
                 return;
             }
 
@@ -1742,11 +1761,20 @@ namespace MiniMixerOverlay.App
 
         private static string NormalizeOverlayMode(string? mode)
         {
-            return string.Equals(mode, OverlayModeGameHook, StringComparison.OrdinalIgnoreCase)
-                ? OverlayModeGameHook
-                : OverlayModeDesktop;
+            // Existing user profiles are migrated to the only supported mode.
+            return OverlayModeGameHook;
         }
 
+        private static string NormalizeHookAssetsPath(string? configuredPath)
+        {
+            if (string.IsNullOrWhiteSpace(configuredPath) ||
+                string.Equals(configuredPath.Trim(), LegacyGameHookAssetsRelativePath,
+                    StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(configuredPath.Trim(), PreviousGameHookAssetsRelativePath,
+                    StringComparison.OrdinalIgnoreCase))
+                return DefaultGameHookAssetsRelativePath;
+            return configuredPath.Trim();
+        }
         private static bool IsDesktopOverlayMode()
         {
             return string.Equals(_overlayMode, OverlayModeDesktop, StringComparison.OrdinalIgnoreCase);
@@ -1854,7 +1882,12 @@ namespace MiniMixerOverlay.App
 
         private static string FormatAutoLimitLabel(int value)
         {
-            return Ui($"Neue Apps auf {value}% setzen", $"Set new apps to {value}%");
+            return $"{Ui("Auto-Limit fur neue Apps", "Auto limit for new apps")}: {value}%";
+        }
+
+        private static string FormatAutoLimitAgeLabel(int value)
+        {
+            return $"{Ui("Max. Installationsalter fur Auto-Limit", "Max install age for auto limit")}: {value} {Ui("Tage", "days")}";
         }
 
         private static string FormatGlassStrengthLabel(int value)
@@ -1876,13 +1909,11 @@ namespace MiniMixerOverlay.App
         {
             return $"{Ui("Rand-Verwischen", "Border smudge")}: {value}%";
         }
-        private static bool IsSystemSoundEntry(AppEntry entry)
+        private static bool IsMasterVolumeEntry(AppEntry entry)
         {
-            return string.Equals(entry.ExePath, "__system_sound__", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(entry.ExeName, "SystemSound", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(entry.DisplayName, "System Sound", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(entry.DisplayName, "Lautstaerke", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(entry.DisplayName, "Lautstärke", StringComparison.OrdinalIgnoreCase);
+            // Only the canonical endpoint master. Never identify controls
+            // by localized label or the independent System Sounds session.
+            return string.Equals(entry.ExePath, "__system_master__", StringComparison.OrdinalIgnoreCase);
         }
         private static string TranslateUiText(string text)
         {
@@ -1906,6 +1937,11 @@ namespace MiniMixerOverlay.App
                 if (text.StartsWith("Auto-Limit fur neue Apps: ", StringComparison.Ordinal))
                 {
                     return "Auto limit for new apps: " + text["Auto-Limit fur neue Apps: ".Length..];
+                }
+
+                if (text.StartsWith("Max. Installationsalter fur Auto-Limit: ", StringComparison.Ordinal))
+                {
+                    return "Max install age for auto limit: " + text["Max. Installationsalter fur Auto-Limit: ".Length..].Replace(" Tage", " days", StringComparison.Ordinal);
                 }
 
                 if (text.StartsWith("Glas-Starke: ", StringComparison.Ordinal))
@@ -1969,6 +2005,11 @@ namespace MiniMixerOverlay.App
             if (text.StartsWith("Auto limit for new apps: ", StringComparison.Ordinal))
             {
                 return "Auto-Limit fur neue Apps: " + text["Auto limit for new apps: ".Length..];
+            }
+
+            if (text.StartsWith("Max install age for auto limit: ", StringComparison.Ordinal))
+            {
+                return "Max. Installationsalter fur Auto-Limit: " + text["Max install age for auto limit: ".Length..].Replace(" days", " Tage", StringComparison.Ordinal);
             }
 
             if (text.StartsWith("Glass Strength: ", StringComparison.Ordinal))
@@ -2123,13 +2164,22 @@ namespace MiniMixerOverlay.App
 
         private static string ResolveGameHookAssetsPath(string? configuredPath)
         {
-            var path = string.IsNullOrWhiteSpace(configuredPath)
-                ? DefaultGameHookAssetsRelativePath
-                : configuredPath.Trim();
+            var path = NormalizeHookAssetsPath(configuredPath);
 
             if (Path.IsPathRooted(path))
             {
                 return path;
+            }
+
+            // The packaged default hook assets are anchored to the executable directory.
+            // Preserve existing semantics for explicit user-configured relative paths.
+            if (string.Equals(path, DefaultGameHookAssetsRelativePath, StringComparison.OrdinalIgnoreCase))
+            {
+                var bundledPath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, path));
+                if (Directory.Exists(bundledPath))
+                {
+                    return bundledPath;
+                }
             }
 
             return Path.GetFullPath(Path.Combine(Environment.CurrentDirectory, path));
@@ -2167,11 +2217,17 @@ namespace MiniMixerOverlay.App
             }
 
             _gameHookRuntime = new GameHookOverlayRuntime(_mainWin, SetGameHookStatus);
-            _gameHookRuntime.ForwardGameInputToWindow = _gameHookForwardInput;
+            _gameHookRuntime.ForwardGameInputToWindow = _gameHookForwardInput || _gameHookIpcSphereInputTest;
+            _gameHookRuntime.ForwardNativeMainInput = _gameHookForwardInput;
+            // Optional auxiliary green-sphere framebuffer is advertised only
+            // to native clients with explicit experimental capability.
+            _gameHookRuntime.SetAuxiliaryWindow(_cornerHintWin);
         }
 
         private static bool StartGameHookRuntime()
         {
+            // Isolated WPF review must never start native IPC, even from settings.
+            if (_isolatedReviewRoot != null) return false;
             if (_mainWin == null)
             {
                 return false;
@@ -2183,29 +2239,52 @@ namespace MiniMixerOverlay.App
                 return false;
             }
 
-            _gameHookRuntime.ForwardGameInputToWindow = _gameHookForwardInput;
+            _gameHookRuntime.ForwardGameInputToWindow = _gameHookForwardInput || _gameHookIpcSphereInputTest;
+            _gameHookRuntime.ForwardNativeMainInput = _gameHookForwardInput;
             if (_gameHookRuntime.IsRunning)
             {
-                ApplyGameHookInputPassThrough(!_gameHookCanInteract);
+                if (_gameHookInputInterceptEnabled)
+                {
+                    _gameHookRuntime.SendInputIntercept(true);
+                }
+
                 return true;
             }
 
             var started = _gameHookRuntime.Start();
+            if (started)
+                NativeGameHookLoader.ResumeAfterRuntimeStart();
             if (!started)
             {
                 SetGameHookStatus(Ui("Game-Hook Runtime konnte nicht starten (Fenster-Handle fehlt evtl. noch).", "Game-hook runtime could not start (window handle may still be missing)."));
                 return false;
             }
 
-            _gameHookEffectiveInputInterceptEnabled = false;
-            ApplyGameHookInputPassThrough(!_gameHookCanInteract);
+            if (_gameHookInputInterceptEnabled)
+            {
+                _gameHookRuntime.SendInputIntercept(true);
+            }
 
             TryAutoInjectForegroundGame();
             return true;
         }
 
+        private static void SignalNativePreviewStop()
+        {
+            // Includes ambiguous/timed-out remote threads omitted from the
+            // UI success list. Stop intent must survive a late native Ready.
+            NativeGameHookLoader.StopAllStartedAttempts();
+            foreach (var pid in _gameHookInjectedProcessIds)
+                _ = NativeGameHookLoader.RequestStop(pid);
+        }
+
+        private static long _nativeRuntimeGeneration;
+
         private static void StopGameHookRuntime()
         {
+            Interlocked.Increment(ref _nativeRuntimeGeneration);
+            if (GameHookBridge.NativePreviewEnabled)
+                SignalNativePreviewStop();
             if (_gameHookRuntime == null)
             {
                 ResetGameHookAutoDetectState();
@@ -2214,8 +2293,15 @@ namespace MiniMixerOverlay.App
 
             _gameHookRuntime.Stop();
             _gameHookInputInterceptEnabled = false;
-            _gameHookEffectiveInputInterceptEnabled = false;
             ResetGameHookAutoDetectState();
+        }
+
+        private static bool ShouldAutoStartGameHookRuntime()
+        {
+            // The WPF-only MM-1 launch needs no native IPC host, frame buffers
+            // or 33-ms timer. Preserve explicit native preview / IPC test opt-ins.
+            return _isolatedReviewRoot == null && _gameHookAutoStartRuntime &&
+                (GameHookBridge.NativePreviewEnabled || _gameHookIpcOnlyTestRun);
         }
 
         private static void SyncGameHookRuntimeState()
@@ -2226,59 +2312,49 @@ namespace MiniMixerOverlay.App
                 return;
             }
 
-            EnsureGameHookRuntimeCreated();
-            _gameHookRuntime!.ForwardGameInputToWindow = _gameHookForwardInput;
-
-            if (_gameHookAutoStartRuntime)
+            if (ShouldAutoStartGameHookRuntime())
             {
+                EnsureGameHookRuntimeCreated();
+                _gameHookRuntime!.ForwardGameInputToWindow = _gameHookForwardInput || _gameHookIpcSphereInputTest;
                 _ = StartGameHookRuntime();
                 return;
             }
 
-            if (_gameHookRuntime.IsRunning)
-            {
+            // An explicit manual start remains active until the user stops it.
+            // Do not allocate native buffers just to show 'Runtime aus'.
+            if (_gameHookRuntime?.IsRunning == true)
                 return;
-            }
 
             SetGameHookStatus(Ui("Game-Hook Runtime ist aus. Starte sie manuell im Settings-Menue.", "Game-hook runtime is off. Start it manually in the settings menu."));
+        }
+        private static void ApplyUserTopmostPreference()
+        {
+            // The persisted checkbox is the only main/settings topmost owner,
+            // regardless of the legacy overlay-mode normalization. The
+            // independent sphere deliberately keeps its own topmost contract.
+            var topmost = _ctrl?.Settings.Window.AlwaysOnTop ?? true;
+            if (_mainWin != null)
+                _mainWin.Topmost = topmost;
+            if (_settingsWin != null)
+                _settingsWin.Topmost = topmost;
+            if (_cornerHintWin != null)
+            {
+                _cornerHintWin.Topmost = true;
+                EnsureCornerHintOnTop();
+            }
         }
 
         private static void ApplyOverlayModeRuntimeState()
         {
             if (_mainWin == null)
-            {
                 return;
-            }
+
+            ApplyUserTopmostPreference();
 
             if (IsDesktopOverlayMode())
             {
-                if (_ctrl != null)
-                {
-                    _mainWin.Topmost = _userAlwaysOnTop;
-                }
-
-                if (_settingsWin != null)
-                {
-                    _settingsWin.Topmost = _mainWin.Topmost;
-                }
-
                 StopGameHookRuntime();
-                _gameHookInputState = GameHookInputState.Unknown;
-                _gameHookInputCandidate = GameHookInputState.Unknown;
-                _gameHookCanInteract = true;
-                ApplyGameHookInputPassThrough(false);
                 return;
-            }
-
-            _mainWin.Topmost = true;
-            if (_settingsWin != null)
-            {
-                _settingsWin.Topmost = true;
-            }
-            if (_cornerHintWin != null)
-            {
-                _cornerHintWin.Topmost = true;
-                EnsureCornerHintOnTop();
             }
 
             if (_edgeDockActive)
@@ -2311,6 +2387,9 @@ namespace MiniMixerOverlay.App
                 SystemParameters.VirtualScreenHeight);
         }
 
+        private static double ClampWindowTop(double desiredTop, Rect workArea, double windowHeight) =>
+            Math.Clamp(desiredTop, workArea.Top, Math.Max(workArea.Top, workArea.Bottom - windowHeight));
+
         private static void EnsureMainWindowInBounds(bool allowDockHidden)
         {
             if (_mainWin == null)
@@ -2336,8 +2415,8 @@ namespace MiniMixerOverlay.App
                 }
             }
 
-            _mainWin.Left = Math.Clamp(_mainWin.Left, minLeft, maxLeft);
-            _mainWin.Top = Math.Clamp(_mainWin.Top, workArea.Top, workArea.Bottom - _mainWin.Height);
+            _mainWin.Left = Math.Clamp(_mainWin.Left, minLeft, Math.Max(minLeft, maxLeft));
+            _mainWin.Top = ClampWindowTop(_mainWin.Top, workArea, _mainWin.Height);
         }
 
         private static void SetEdgeDockEnabled(bool enabled)
@@ -2375,7 +2454,7 @@ namespace MiniMixerOverlay.App
                     var expandForEdit = _settingsWin != null || _isUserInteracting;
                     ApplyEdgeDockPlacement(expand: expandForEdit, force: true);
                     ApplyCornerRevealVisualState(true);
-                    HideCornerHintWindow();
+                    UpdateCornerHintWindow();
                 }
                 return;
             }
@@ -2437,10 +2516,19 @@ namespace MiniMixerOverlay.App
                 return;
             }
 
-            var nowUtc = DateTime.UtcNow;
             if (!TryGetCursorPosition(out var cursor))
             {
                 ApplyEdgeDockPlacement(expand: true);
+                return;
+            }
+
+            UpdateEdgeDockStateAtCursor(cursor, DateTime.UtcNow);
+        }
+
+        private static void UpdateEdgeDockStateAtCursor(Point cursor, DateTime nowUtc)
+        {
+            if (!_edgeDockEnabled || !_edgeDockActive || _mainWin == null || _mainWin.WindowState == WindowState.Minimized)
+            {
                 return;
             }
 
@@ -2467,7 +2555,7 @@ namespace MiniMixerOverlay.App
 
                 if (inEdgeZone && !_edgeDockExpanded && _bringToFrontOnHover && _settingsWin == null)
                 {
-                    BringMainWindowToFront(activate: false);
+                    BringMainWindowToFront(activate: IsDesktopOverlayMode());
                 }
             }
 
@@ -2508,9 +2596,10 @@ namespace MiniMixerOverlay.App
             var workArea = GetMainWorkAreaOrVirtual();
             _edgeDockVisibleWidth = (int)Math.Clamp(_edgeDockVisibleWidth, EdgeDockVisibleMin, EdgeDockVisibleMax);
             _edgeDockSide = NormalizeDockSide(_edgeDockSide);
+            _edgeDockExpanded = expand;
             ApplyContextualMainWindowHeight();
 
-            var top = Math.Clamp(_mainWin.Top, workArea.Top, workArea.Bottom - _mainWin.Height);
+            var top = ClampWindowTop(_mainWin.Top, workArea, _mainWin.Height);
             var expandedLeft = _edgeDockSide == "left" ? workArea.Left : workArea.Right - _mainWin.Width;
             var hiddenLeft = _edgeDockSide == "left"
                 ? workArea.Left - (_mainWin.Width - _edgeDockVisibleWidth)
@@ -2526,8 +2615,6 @@ namespace MiniMixerOverlay.App
             {
                 _mainWin.Top = top;
             }
-
-            _edgeDockExpanded = expand;
             _lastWindowLeft = _mainWin.Left;
             _lastWindowTop = _mainWin.Top;
             RepositionSettingsWindow();
@@ -2543,6 +2630,7 @@ namespace MiniMixerOverlay.App
             _edgeDockActive = true;
             _edgeDockExpanded = expand;
             _rememberedSnapCorner = AlignCornerToDockSide(_rememberedSnapCorner, _edgeDockSide);
+            ApplyContextualMainWindowHeight();
 
             var workArea = GetMainWorkAreaOrVirtual();
             _mainWin.Top = IsTopCorner(_rememberedSnapCorner)
@@ -2565,8 +2653,9 @@ namespace MiniMixerOverlay.App
                 return;
             }
 
-            var forceTopmost = !IsDesktopOverlayMode();
-            var insertAfter = (forceTopmost || _mainWin.Topmost) ? HwndTopmost : HwndTop;
+            // Hover/raise must respect the existing topmost preference,
+            // not accidentally re-enable it in normalized gamehook mode.
+            var insertAfter = _mainWin.Topmost ? HwndTopmost : HwndTop;
             var flags = SwpNoMove | SwpNoSize | SwpShowWindow;
             if (!activate)
             {
@@ -2587,52 +2676,33 @@ namespace MiniMixerOverlay.App
                 ShowWindow(handle, SwShow);
                 SetForegroundWindow(handle);
             }
+            // The independent sphere must stay above a raised mixer HWND.
+            EnsureCornerHintOnTop();
         }
 
         private static void UpdateCornerRevealState()
         {
             if (_mainWin == null || _mainWin.WindowState == WindowState.Minimized)
             {
-                HideCornerHintWindow();
+                UpdateCornerHintWindow();
                 return;
             }
 
             var desktopMode = IsDesktopOverlayMode();
 
-            if (!desktopMode)
-            {
-                var canInteract = UpdateGameHookInputPolicy();
-                ApplyGameHookInputPassThrough(!canInteract);
-
-                if (!canInteract && _settingsWin == null && !_isUserInteracting)
-                {
-                    _cornerRevealVisibleUntilUtc = DateTime.MinValue;
-                    ApplyCornerRevealVisualState(false);
-                    UpdateCornerHintWindow();
-                    return;
-                }
-            }
-
-            // Moving the visible corner hint must not reveal the main window; otherwise the
-            // hint would disappear under the pointer while the user is positioning it.
             if (_cornerHintDragging)
             {
+                // Do not reveal the main window and hide the sphere while it is dragged.
                 _cornerRevealVisibleUntilUtc = DateTime.MinValue;
                 ApplyCornerRevealVisualState(false);
                 UpdateCornerHintWindow();
                 return;
             }
 
-            // Dragging/sliding is an atomic user interaction. Timers may keep the overlay
-            // visible, but must not mutate dock/snap state until the interaction ends.
-            if (_isUserInteracting)
+            if (!_isUserInteracting)
             {
-                _cornerRevealVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(CornerRevealHoldMs);
-                ApplyCornerRevealVisualState(true);
-                return;
+                EnsureMainWindowInBounds(allowDockHidden: desktopMode && _edgeDockEnabled && _edgeDockActive);
             }
-
-            EnsureMainWindowInBounds(allowDockHidden: desktopMode && _edgeDockEnabled && _edgeDockActive);
 
             if (desktopMode && _edgeDockEnabled)
             {
@@ -2644,7 +2714,7 @@ namespace MiniMixerOverlay.App
                 if (_edgeDockActive)
                 {
                     ApplyCornerRevealVisualState(true);
-                    HideCornerHintWindow();
+                    UpdateCornerHintWindow();
                     UpdateEdgeDockState();
                     return;
                 }
@@ -2652,33 +2722,32 @@ namespace MiniMixerOverlay.App
 
             if (!_cornerRevealEnabled)
             {
-                ApplyCornerRevealVisualState(true);
-                HideCornerHintWindow();
+                // Do not undo explicit Minus when corner reveal is disabled.
+                // Reopen a collapsed mixer on the sphere, no secondary state.
+                if (!_cornerRevealVisible &&
+                    TryGetCursorPosition(out var directCursor) &&
+                    IsCursorInRevealHotZone(directCursor))
+                {
+                    ApplyCornerRevealVisualState(true);
+                }
+                UpdateCornerHintWindow();
                 return;
             }
 
             var nowUtc = DateTime.UtcNow;
             if (!TryGetCursorPosition(out var cursor))
             {
-                ApplyCornerRevealVisualState(true);
-                HideCornerHintWindow();
+                // Missing cursor data does not imply a hover.
+                ApplyCornerRevealVisualState(_settingsWin != null || _isUserInteracting);
+                UpdateCornerHintWindow();
                 return;
             }
 
             var cursorInsideMainWindow = IsCursorInsideWindow(cursor, _mainWin);
             var keepVisibleByWindowHover = _cornerRevealVisible && cursorInsideMainWindow;
 
-            // Desktop-Overlay: optionales Fenster-Hover-Reveal ueber Checkbox.
-            // Hook-Modus: Sichtbarwerden nur ueber den Kreis/Hotzone.
-            if (desktopMode && _bringToFrontOnHover && cursorInsideMainWindow)
-            {
-                _cornerRevealVisibleUntilUtc = nowUtc.AddMilliseconds(CornerRevealHoldMs);
-                if (!_cornerRevealVisible && _settingsWin == null)
-                {
-                    BringMainWindowToFront(activate: false);
-                }
-            }
-
+            // The main-window rectangle retains an already visible mixer,
+            // but must never reopen an invisible one. Reopen only via sphere.
             if (keepVisibleByWindowHover || IsCursorInsideWindow(cursor, _settingsWin) || _isUserInteracting || _settingsWin != null)
             {
                 _cornerRevealVisibleUntilUtc = nowUtc.AddMilliseconds(CornerRevealHoldMs);
@@ -2698,317 +2767,37 @@ namespace MiniMixerOverlay.App
             UpdateCornerHintWindow();
         }
 
-        private static bool UpdateGameHookInputPolicy()
+        private static void ApplyCornerRevealVisualState(bool visible)
         {
+            if (_mainWin == null) return;
+
+            _cornerRevealVisible = visible;
             if (IsDesktopOverlayMode())
             {
-                _gameHookInputState = GameHookInputState.Unknown;
-                _gameHookInputCandidate = GameHookInputState.Unknown;
-                _gameHookInputCandidateSinceUtc = DateTime.MinValue;
-                _gameHookCanInteract = true;
-                return true;
-            }
-
-            if (_settingsWin != null || _isUserInteracting || _cornerHintDragging)
-            {
-                _gameHookCanInteract = true;
-                return true;
-            }
-
-            var nowUtc = DateTime.UtcNow;
-            var sample = ReadGameHookInputSample();
-            var candidate = ClassifyGameHookInputSample(sample);
-
-            if (candidate != _gameHookInputCandidate)
-            {
-                _gameHookInputCandidate = candidate;
-                _gameHookInputCandidateSinceUtc = nowUtc;
-            }
-
-            if (candidate != GameHookInputState.Unknown && candidate != _gameHookInputState)
-            {
-                var requiredStableMs = candidate == GameHookInputState.GameUiCursor
-                    ? GameHookUiCursorStableMs
-                    : GameHookCapturedStableMs;
-
-                if ((nowUtc - _gameHookInputCandidateSinceUtc).TotalMilliseconds >= requiredStableMs)
+                // A transparent WPF HWND still interferes with desktop hover.
+                // Hide only the desktop main, never the independently visible sphere.
+                if (visible)
                 {
-                    _gameHookInputState = candidate;
-                    _gameHookCanInteract = candidate == GameHookInputState.GameUiCursor;
+                    _mainWin.Opacity = 1.0;
+                    _mainWin.IsHitTestVisible = true;
+                    if (!_mainWin.IsVisible) _mainWin.Show();
                 }
-            }
-            else if (candidate == _gameHookInputState && candidate != GameHookInputState.Unknown)
-            {
-                _gameHookCanInteract = candidate == GameHookInputState.GameUiCursor;
-            }
-
-            LogGameHookInputDecision(sample, candidate, _gameHookInputState, _gameHookCanInteract);
-            return _gameHookCanInteract;
-        }
-
-        private static GameHookInputSample ReadGameHookInputSample()
-        {
-            var sample = new GameHookInputSample();
-
-            if (!GameHookBridge.TryGetForegroundWindowInfo(out var foreground) || foreground.Hwnd == IntPtr.Zero)
-            {
-                return sample with { ForegroundKnown = false };
-            }
-
-            sample = sample with
-            {
-                ForegroundKnown = true,
-                ForegroundHwnd = foreground.Hwnd,
-                ForegroundPid = foreground.ProcessId,
-                ForegroundProcessName = foreground.ProcessName ?? string.Empty,
-                ForegroundIsOverlay = IsOverlayForeground(foreground)
-            };
-
-            var cursorInfo = new NativeCursorInfo { CbSize = Marshal.SizeOf<NativeCursorInfo>() };
-            if (GetCursorInfo(ref cursorInfo))
-            {
-                sample = sample with
+                else
                 {
-                    CursorKnown = true,
-                    CursorVisible = (cursorInfo.Flags & CursorShowing) != 0,
-                    CursorX = cursorInfo.ScreenPos.X,
-                    CursorY = cursorInfo.ScreenPos.Y
-                };
-            }
-
-            if (GetClipCursor(out var clipRect))
-            {
-                sample = sample with
-                {
-                    ClipKnown = true,
-                    ClipLeft = clipRect.Left,
-                    ClipTop = clipRect.Top,
-                    ClipRight = clipRect.Right,
-                    ClipBottom = clipRect.Bottom
-                };
-            }
-
-            var threadId = GetWindowThreadProcessId(foreground.Hwnd, out _);
-            if (threadId != 0)
-            {
-                var guiInfo = new NativeGuiThreadInfo { CbSize = Marshal.SizeOf<NativeGuiThreadInfo>() };
-                if (GetGUIThreadInfo(threadId, ref guiInfo))
-                {
-                    sample = sample with
-                    {
-                        CaptureKnown = true,
-                        CaptureHwnd = guiInfo.HwndCapture
-                    };
+                    _mainWin.IsHitTestVisible = false;
+                    if (_mainWin.IsVisible) _mainWin.Hide();
                 }
-            }
-
-            if (GetWindowRect(foreground.Hwnd, out var foregroundRect))
-            {
-                sample = sample with
-                {
-                    ForegroundRectKnown = true,
-                    ForegroundLeft = foregroundRect.Left,
-                    ForegroundTop = foregroundRect.Top,
-                    ForegroundRight = foregroundRect.Right,
-                    ForegroundBottom = foregroundRect.Bottom
-                };
-            }
-
-            return sample;
-        }
-
-        private static GameHookInputState ClassifyGameHookInputSample(GameHookInputSample sample)
-        {
-            if (!sample.ForegroundKnown || sample.ForegroundIsOverlay || !sample.CursorKnown)
-            {
-                return GameHookInputState.Unknown;
-            }
-
-            if (!sample.CursorVisible)
-            {
-                return GameHookInputState.GameplayCaptured;
-            }
-
-            if (sample.CaptureKnown && sample.CaptureHwnd != IntPtr.Zero && !IsMiniMixerWindowHandle(sample.CaptureHwnd))
-            {
-                return GameHookInputState.GameplayCaptured;
-            }
-
-            return GameHookInputState.GameUiCursor;
-        }
-
-        private static void ApplyGameHookInputPassThrough(bool passThrough)
-        {
-            if (_mainWin != null)
-            {
-                SetWindowClickThrough(_mainWin, passThrough);
-            }
-
-            if (_cornerHintWin != null)
-            {
-                SetWindowClickThrough(_cornerHintWin, passThrough);
-            }
-
-            if (_gameHookRuntime?.IsRunning == true)
-            {
-                _gameHookRuntime.ForwardGameInputToWindow = !passThrough && _gameHookForwardInput;
-
-                var effectiveIntercept = !passThrough && _gameHookInputInterceptEnabled;
-                if (effectiveIntercept != _gameHookEffectiveInputInterceptEnabled)
-                {
-                    _gameHookRuntime.SendInputIntercept(effectiveIntercept);
-                    _gameHookEffectiveInputInterceptEnabled = effectiveIntercept;
-                }
-            }
-        }
-
-        private static bool IsMiniMixerWindowHandle(IntPtr hwnd)
-        {
-            if (hwnd == IntPtr.Zero)
-            {
-                return false;
-            }
-
-            return (_mainWin != null && new WindowInteropHelper(_mainWin).Handle == hwnd) ||
-                   (_settingsWin != null && new WindowInteropHelper(_settingsWin).Handle == hwnd) ||
-                   (_cornerHintWin != null && new WindowInteropHelper(_cornerHintWin).Handle == hwnd);
-        }
-
-        private static void SetWindowClickThrough(Window window, bool enabled)
-        {
-            var handle = new WindowInteropHelper(window).Handle;
-            if (handle == IntPtr.Zero)
-            {
-                return;
-            }
-
-            var exStyle = GetWindowLongPtr(handle, GwlExStyle).ToInt64();
-            var nextStyle = enabled
-                ? exStyle | WsExTransparent | WsExNoActivate
-                : exStyle & ~WsExTransparent;
-
-            if (nextStyle != exStyle)
-            {
-                SetWindowLongPtr(handle, GwlExStyle, new IntPtr(nextStyle));
-                SetWindowPos(
-                    handle,
-                    window.Topmost ? HwndTopmost : HwndTop,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SwpNoMove | SwpNoSize | SwpNoActivate | SwpFrameChanged);
-            }
-
-            if (enabled)
-            {
-                _clickThroughWindows.Add(handle);
             }
             else
             {
-                _clickThroughWindows.Remove(handle);
-            }
-        }
-
-        private static void LogGameHookInputDecision(
-            GameHookInputSample sample,
-            GameHookInputState candidate,
-            GameHookInputState stable,
-            bool canInteract)
-        {
-            try
-            {
-                var fingerprint = string.Join("|",
-                    sample.ForegroundProcessName,
-                    sample.ForegroundPid,
-                    sample.CursorKnown ? (sample.CursorVisible ? "visible" : "hidden") : "cursor?",
-                    sample.CaptureKnown ? $"capture=0x{sample.CaptureHwnd.ToInt64():X}" : "capture?",
-                    sample.ClipKnown ? $"clip={sample.ClipLeft},{sample.ClipTop},{sample.ClipRight},{sample.ClipBottom}" : "clip?",
-                    candidate,
-                    stable,
-                    canInteract,
-                    _gameHookInputInterceptEnabled);
-
-                var changed = !string.Equals(fingerprint, _gameHookInputLastLogFingerprint, StringComparison.Ordinal);
-                if (!changed)
-                {
-                    return;
-                }
-
-                _gameHookInputLastLogFingerprint = fingerprint;
-
-                var logDir = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "MiniMixerOverlay",
-                    "logs");
-                Directory.CreateDirectory(logDir);
-
-                var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} " +
-                           $"fg={sample.ForegroundProcessName} pid={sample.ForegroundPid} hwnd=0x{sample.ForegroundHwnd.ToInt64():X} " +
-                           $"cursor={(sample.CursorKnown ? (sample.CursorVisible ? "visible" : "hidden") : "unknown")} " +
-                           $"pos={(sample.CursorKnown ? $"{sample.CursorX},{sample.CursorY}" : "?")} " +
-                           $"capture={(sample.CaptureKnown ? $"0x{sample.CaptureHwnd.ToInt64():X}" : "unknown")} " +
-                           $"clip={(sample.ClipKnown ? $"{sample.ClipLeft},{sample.ClipTop},{sample.ClipRight},{sample.ClipBottom}" : "unknown")} " +
-                           $"fgRect={(sample.ForegroundRectKnown ? $"{sample.ForegroundLeft},{sample.ForegroundTop},{sample.ForegroundRight},{sample.ForegroundBottom}" : "unknown")} " +
-                           $"hookIntercept={_gameHookInputInterceptEnabled} candidate={candidate} stable={stable} canInteract={canInteract}" +
-                           Environment.NewLine;
-
-                AppendBoundedLog(Path.Combine(logDir, "gamehook-input.log"), line, GameHookInputLogMaxBytes, DiagnosticLogArchiveCount);
-            }
-            catch
-            {
-                // Input diagnostics must never affect overlay behavior.
-            }
-        }
-
-        private readonly record struct GameHookInputSample(
-            bool ForegroundKnown = false,
-            IntPtr ForegroundHwnd = default,
-            uint ForegroundPid = 0,
-            string ForegroundProcessName = "",
-            bool ForegroundIsOverlay = false,
-            bool CursorKnown = false,
-            bool CursorVisible = false,
-            int CursorX = 0,
-            int CursorY = 0,
-            bool CaptureKnown = false,
-            IntPtr CaptureHwnd = default,
-            bool ClipKnown = false,
-            int ClipLeft = 0,
-            int ClipTop = 0,
-            int ClipRight = 0,
-            int ClipBottom = 0,
-            bool ForegroundRectKnown = false,
-            int ForegroundLeft = 0,
-            int ForegroundTop = 0,
-            int ForegroundRight = 0,
-            int ForegroundBottom = 0);
-
-        private static void ApplyCornerRevealVisualState(bool visible)
-        {
-            if (_mainWin == null)
-            {
-                return;
+                // Game-Hook uses the WPF render surface; keep its HWND alive.
+                _mainWin.Opacity = visible ? 1.0 : 0.0;
+                _mainWin.IsHitTestVisible = visible;
             }
 
-            if (!_cornerRevealEnabled)
-            {
-                visible = true;
-            }
-
-            if (_cornerRevealVisible == visible)
-            {
-                UpdateCornerHintWindow();
-                return;
-            }
-
-            _cornerRevealVisible = visible;
-            var hiddenOpacity = IsDesktopOverlayMode() ? CornerRevealHiddenOpacity : 0.0;
-            _mainWin.Opacity = visible ? 1.0 : hiddenOpacity;
-            _mainWin.IsHitTestVisible = visible;
             UpdateCornerHintWindow();
+            EnsureCornerHintOnTop();
         }
-
         private static bool IsCursorInsideWindow(Point cursor, Window? window)
         {
             if (window == null || !window.IsVisible)
@@ -3235,33 +3024,35 @@ namespace MiniMixerOverlay.App
         private static void UpdateCornerHintWindow()
         {
             var desktopMode = IsDesktopOverlayMode();
-            var hideForDocking = desktopMode && _edgeDockEnabled && _edgeDockActive;
-            var hideWhenMainVisible = desktopMode && _cornerRevealVisible && !_cornerHintDragging;
 
-            if (_mainWin == null || hideForDocking || !_cornerRevealEnabled || hideWhenMainVisible || (_settingsWin != null && !_cornerHintDragging) || _mainWin.WindowState == WindowState.Minimized || (!_cornerHintShowDot && !_cornerHintShowValue))
+            // The desktop sphere is an independently configured WPF control,
+            // not the visibility indicator for the larger reveal/dock window.
+            // Keep the established game-hook visibility gates unchanged.
+            if (_mainWin == null || (!_cornerHintShowDot && !_cornerHintShowValue))
             {
                 HideCornerHintWindow();
                 return;
             }
 
+            // A transient monitor/window transition must not lose the sphere.
             if (!TryGetMonitorWorkAreaForOverlayTarget(out var workArea))
-            {
-                HideCornerHintWindow();
-                return;
-            }
+                workArea = GetMainWorkAreaOrVirtual();
 
             var corner = ResolveCornerHintCorner(workArea);
 
             EnsureCornerHintWindow();
-            if (_cornerHintWin != null)
-            {
-                SetWindowClickThrough(_cornerHintWin, !desktopMode && !_gameHookCanInteract);
-            }
             if (_cornerHintWin == null)
             {
                 return;
             }
 
+            // Settings/mode transitions can change permitted mouse interaction.
+            var mayInteract = CanInteractWithCornerHint();
+            _cornerHintWin.IsHitTestVisible = mayInteract;
+            if (_cornerHintWin.Content is UIElement sphereRoot)
+            {
+                sphereRoot.IsHitTestVisible = mayInteract;
+            }
             UpdateCornerHintVolumeLabel();
 
             var hintWidth = _cornerHintWin.Width > 1 ? _cornerHintWin.Width : CornerHintDiameter;
@@ -3349,6 +3140,19 @@ namespace MiniMixerOverlay.App
             return new Point(x, y);
         }
 
+        // Optional edge magnetism. A freely placed sphere never jumps to a corner.
+        private static Point SnapSphereToEdges(Point position, Rect workArea,
+            double width, double height, bool enabled)
+        {
+            if (!enabled) return position;
+            var right = Math.Max(workArea.Left, workArea.Right - width);
+            var bottom = Math.Max(workArea.Top, workArea.Bottom - height);
+            var x = Math.Abs(position.X - workArea.Left) <= EdgeDockSnapDistancePx
+                ? workArea.Left : Math.Abs(position.X - right) <= EdgeDockSnapDistancePx ? right : position.X;
+            var y = Math.Abs(position.Y - workArea.Top) <= EdgeDockSnapDistancePx
+                ? workArea.Top : Math.Abs(position.Y - bottom) <= EdgeDockSnapDistancePx ? bottom : position.Y;
+            return new Point(x, y);
+        }
         private static void UpdateCornerHintDotCenter()
         {
             if (_cornerHintWin == null)
@@ -3388,27 +3192,18 @@ namespace MiniMixerOverlay.App
 
         private static void CaptureForegroundAudioContext()
         {
-            if (_ctrl == null || _ctrl.AppEntries.Count == 0)
-            {
-                return;
-            }
-
+            if (_ctrl == null || _ctrl.AppEntries.Count == 0) return;
             try
             {
-                if (!GameHookBridge.TryGetForegroundWindowInfo(out var foreground) || IsOverlayForeground(foreground))
-                {
-                    return;
-                }
-
+                if (!GameHookBridge.TryGetForegroundWindowInfo(out var foreground, requireTitle: false) ||
+                    IsOverlayForeground(foreground)) return;
                 var entry = FindForegroundAudioEntry(foreground);
-                if (entry != null && !IsSystemSoundEntry(entry))
-                {
+                if (entry != null && !IsMasterVolumeEntry(entry))
                     RememberForegroundAudioEntry(entry);
-                }
             }
             catch
             {
-                // Foreground capture is best-effort and must never block overlay interaction.
+                // Best-effort context read; never interfere with the user's interaction.
             }
         }
 
@@ -3439,13 +3234,13 @@ namespace MiniMixerOverlay.App
 
             try
             {
-                if (!GameHookBridge.TryGetForegroundWindowInfo(out var foreground))
+                if (!GameHookBridge.TryGetForegroundWindowInfo(out var foreground, requireTitle: false))
                 {
                     return TryGetRememberedForegroundAudioEntry();
                 }
 
                 var entry = FindForegroundAudioEntry(foreground);
-                if (entry != null && !IsSystemSoundEntry(entry))
+                if (entry != null && !IsMasterVolumeEntry(entry))
                 {
                     RememberForegroundAudioEntry(entry);
                 }
@@ -3551,14 +3346,12 @@ namespace MiniMixerOverlay.App
 
         private static void RememberForegroundAudioEntry(AppEntry? entry)
         {
-            if (entry == null || IsSystemSoundEntry(entry) || string.IsNullOrWhiteSpace(entry.ExePath))
+            if (entry == null || IsMasterVolumeEntry(entry) || string.IsNullOrWhiteSpace(entry.ExePath))
             {
                 return;
             }
 
-            _lastNonSystemForegroundExePath = !string.IsNullOrWhiteSpace(entry.AppIdentityKey)
-                ? entry.AppIdentityKey
-                : entry.ExePath;
+            _lastNonSystemForegroundExePath = entry.ExePath;
             _lastNonSystemForegroundSeenUtc = DateTime.UtcNow;
         }
 
@@ -3570,9 +3363,8 @@ namespace MiniMixerOverlay.App
             }
 
             var remembered = _ctrl.AppEntries.FirstOrDefault(entry =>
-                !IsSystemSoundEntry(entry) &&
-                (string.Equals(entry.AppIdentityKey, _lastNonSystemForegroundExePath, StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(entry.ExePath, _lastNonSystemForegroundExePath, StringComparison.OrdinalIgnoreCase)));
+                !IsMasterVolumeEntry(entry) &&
+                string.Equals(entry.ExePath, _lastNonSystemForegroundExePath, StringComparison.OrdinalIgnoreCase));
 
             if (remembered != null)
             {
@@ -3608,6 +3400,11 @@ namespace MiniMixerOverlay.App
 
             return key;
         }
+
+        // The sphere is an ordinary desktop WPF HWND in both overlay modes.
+        // Its mouse handling does not forward input into a game and must not be
+        // gated by the separate native game-hook input-interception setting.
+        private static bool CanInteractWithCornerHint() => true;
 
         private static void EnsureCornerHintWindow()
         {
@@ -3653,7 +3450,7 @@ namespace MiniMixerOverlay.App
                 Width = CornerHintDiameter,
                 Height = CornerHintDiameter,
                 Background = Brushes.Transparent,
-                IsHitTestVisible = true,
+                IsHitTestVisible = CanInteractWithCornerHint(),
                 Cursor = Cursors.SizeAll
             };
             root.Children.Add(dot);
@@ -3674,11 +3471,12 @@ namespace MiniMixerOverlay.App
                 Content = root
             };
 
-            _cornerHintWin.IsHitTestVisible = true;
+            _cornerHintWin.IsHitTestVisible = CanInteractWithCornerHint();
 
             root.MouseLeftButtonDown += (_, e) =>
             {
-                if (_cornerHintWin == null || e.ChangedButton != MouseButton.Left)
+                if (_cornerHintWin == null || !CanInteractWithCornerHint() ||
+                    e.ChangedButton != MouseButton.Left)
                 {
                     return;
                 }
@@ -3714,6 +3512,16 @@ namespace MiniMixerOverlay.App
                 e.Handled = true;
             };
 
+            root.LostMouseCapture += (_, _) =>
+            {
+                // A native WM_CANCELMODE must terminate sphere dragging without
+                // forging WM_LBUTTONUP on a control after focus/IPC loss.
+                if (!_cornerHintDragging) return;
+                _cornerHintDragging = false;
+                _isUserInteracting = false;
+                QueuePersistCurrentState();
+            };
+
             root.MouseLeftButtonUp += (_, e) =>
             {
                 if (!_cornerHintDragging)
@@ -3723,10 +3531,28 @@ namespace MiniMixerOverlay.App
 
                 _cornerHintDragging = false;
                 _isUserInteracting = false;
+                if (_cornerHintWin != null && _cornerHintManualPosition)
+                {
+                    var position = GetValidatedManualCornerHintPosition(_cornerHintWin.Width, _cornerHintWin.Height);
+                    var monitor = MonitorFromPoint(new NativePoint
+                    {
+                        X = (int)Math.Round(position.X + _cornerHintWin.Width / 2),
+                        Y = (int)Math.Round(position.Y + _cornerHintWin.Height / 2)
+                    }, MonitorDefaultToNearest);
+                    if (TryGetWorkAreaForMonitor(monitor, out var area))
+                    {
+                        position = SnapSphereToEdges(position, area,
+                            _cornerHintWin.Width, _cornerHintWin.Height, _edgeDockEnabled);
+                    }
+                    _cornerHintManualX = _cornerHintWin.Left = position.X;
+                    _cornerHintManualY = _cornerHintWin.Top = position.Y;
+                    UpdateCornerHintDotCenter();
+                }
                 root.ReleaseMouseCapture();
                 QueuePersistCurrentState();
                 e.Handled = true;
             };
+
 
             _cornerHintWin.SourceInitialized += (_, _) =>
             {
@@ -3735,6 +3561,7 @@ namespace MiniMixerOverlay.App
             };
             _cornerHintWin.Closed += (_, _) =>
             {
+                _gameHookRuntime?.SetAuxiliaryWindow(null);
                 _cornerHintWin = null;
                 _cornerHintDot = null;
                 _cornerHintVolumeText = null;
@@ -3742,6 +3569,7 @@ namespace MiniMixerOverlay.App
                 _cornerHintDragging = false;
             };
             ApplyCornerHintTheme();
+            _gameHookRuntime?.SetAuxiliaryWindow(_cornerHintWin);
         }
 
         private static void HideCornerHintWindow()
@@ -3769,7 +3597,9 @@ namespace MiniMixerOverlay.App
 
         private static void EnsureCornerHintOnTop()
         {
-            if (_cornerHintWin == null)
+            // SWP_SHOWWINDOW below must never unhide a deliberately disabled
+            // sphere merely because the main window was raised.
+            if (_cornerHintWin == null || !_cornerHintWin.IsVisible)
             {
                 return;
             }
@@ -3817,6 +3647,9 @@ namespace MiniMixerOverlay.App
                 _glassBorderThickness,
                 _glassBorderSmudge);
             ApplyCornerHintTheme();
+            // Card accents are snapshots made by BuildCard; rebind them during
+            // live settings color previews, without refreshing real audio.
+            QueueSettingsUiPreviewRefresh();
         }
 
         private static void ApplyGlassBorderTheme(
@@ -3885,7 +3718,13 @@ namespace MiniMixerOverlay.App
 
             var strength = _glassStrength / 100.0;
             var glow = Math.Clamp(0.34 + (strength * 0.48), 0.30, 0.82);
+            if (_cornerHintWin != null)
+            {
+                _cornerHintWin.Opacity = 1.0 - Math.Clamp(_cornerHintTransparencyPercent, 0, 80) / 100.0;
+            }
 
+            // ZIP reference: dark glass fill and lightly accented rim.
+            // Whole-window opacity is still controlled separately above.
             var hintBase = BlendColor(Color.FromRgb(14, 20, 32), _activeGlassAccent, 0.22);
             var hintRim = BlendColor(_activeGlassAccent, Colors.White, 0.18);
             _cornerHintDot.Background = new SolidColorBrush(Color.FromArgb(224, hintBase.R, hintBase.G, hintBase.B));
@@ -3931,119 +3770,6 @@ namespace MiniMixerOverlay.App
             }
 
             return Color.FromRgb(245, 252, 255);
-        }
-
-        private static void NormalizeGlassColorOwnership()
-        {
-            // V3 exposes one simple appearance choice: Windows accent or a small preset palette.
-            // Legacy custom colors are migrated once to the nearest preset instead of leaving a
-            // hidden second owner behind.
-            if (_glassUseCustomColor)
-            {
-                if (TryParseHexColor(_glassCustomColorHex, out var legacyCustom))
-                {
-                    _glassPaletteName = FindNearestGlassPaletteName(legacyCustom);
-                }
-
-                _glassUseCustomColor = false;
-                _useWindowsAccentForGlass = false;
-            }
-
-            _glassBorderUseCustomColor = false;
-
-            if (_cornerHintUseCustomValueColor)
-            {
-                _cornerHintUseCustomValueColor = false;
-                _cornerHintValueColor = "Auto";
-            }
-        }
-
-        private static string FindNearestGlassPaletteName(Color color)
-        {
-            var bestName = "Cyan";
-            var bestDistance = double.MaxValue;
-
-            foreach (var pair in _glassPalette)
-            {
-                var dr = color.R - pair.Value.R;
-                var dg = color.G - pair.Value.G;
-                var db = color.B - pair.Value.B;
-                var distance = (dr * dr) + (dg * dg) + (db * db);
-                if (distance < bestDistance)
-                {
-                    bestDistance = distance;
-                    bestName = pair.Key;
-                }
-            }
-
-            return bestName;
-        }
-
-        private static void StartWindowsThemeWatch()
-        {
-            if (_windowsThemeWatchInstalled)
-            {
-                return;
-            }
-
-            try
-            {
-                SystemEvents.UserPreferenceChanged += OnWindowsUserPreferenceChanged;
-                _windowsThemeWatchInstalled = true;
-            }
-            catch
-            {
-                // Theme updates are best-effort. The next explicit UI theme change still refreshes it.
-            }
-        }
-
-        private static void StopWindowsThemeWatch()
-        {
-            if (!_windowsThemeWatchInstalled)
-            {
-                return;
-            }
-
-            try
-            {
-                SystemEvents.UserPreferenceChanged -= OnWindowsUserPreferenceChanged;
-            }
-            catch
-            {
-                // ignore shutdown races
-            }
-            finally
-            {
-                _windowsThemeWatchInstalled = false;
-            }
-        }
-
-        private static void OnWindowsUserPreferenceChanged(object? sender, UserPreferenceChangedEventArgs e)
-        {
-            if (!_useWindowsAccentForGlass || _glassUseCustomColor || _mainWin == null)
-            {
-                return;
-            }
-
-            if (e.Category is not (UserPreferenceCategory.Color or UserPreferenceCategory.VisualStyle or UserPreferenceCategory.General))
-            {
-                return;
-            }
-
-            try
-            {
-                _mainWin.Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (_useWindowsAccentForGlass && !_glassUseCustomColor)
-                    {
-                        ApplyGlassTheme();
-                    }
-                }));
-            }
-            catch
-            {
-                // window may be closing
-            }
         }
 
         private static Color ResolveGlassAccentColor()
@@ -4247,12 +3973,40 @@ namespace MiniMixerOverlay.App
                 return 0;
             }
 
-            return (_edgeDockEnabled && _edgeDockActive && !_edgeDockExpanded) ? 1 : configured;
+            // Visible Apps is an exact card limit, not a minimum. Icon-only
+            // stays zero and the collapsed edge dock still shows one card.
+            return (_edgeDockEnabled && _edgeDockActive && !_edgeDockExpanded)
+                ? 1 : configured;
         }
 
         private static void ApplyAppListVisibilityState()
         {
             var showCards = GetEffectiveVisibleApps() > 0;
+            var compactDock = _edgeDockEnabled && _edgeDockActive && !_edgeDockExpanded;
+
+            // The quick dock contains only one compact card, not the desktop header/status.
+            if (_mainGlassBorder?.Child is Grid layout && layout.RowDefinitions.Count == 3)
+            {
+                layout.RowDefinitions[0].Height = new GridLength(compactDock ? 0 : DesktopHeaderHeight);
+                layout.RowDefinitions[2].Height = new GridLength(compactDock ? 0 : DesktopStatusHeight);
+            }
+
+            // On adjacent monitors a window shifted past the edge is still visible.
+            // Clip the hidden side so only the interactive handle remains rendered.
+            if (_mainGlassBorder != null && _mainWin != null)
+            {
+                if (compactDock)
+                {
+                    var visibleWidth = Math.Clamp(_edgeDockVisibleWidth, EdgeDockVisibleMin, EdgeDockVisibleMax);
+                    var clipLeft = _edgeDockSide == "left" ? Math.Max(0, _mainWin.Width - visibleWidth) : 0;
+                    _mainGlassBorder.Clip = new RectangleGeometry(new Rect(
+                        clipLeft, 0, visibleWidth, _mainWin.Height));
+                }
+                else
+                {
+                    _mainGlassBorder.Clip = null;
+                }
+            }
 
             if (_appListRowDefinition != null)
             {
@@ -4378,36 +4132,37 @@ namespace MiniMixerOverlay.App
             row.Children.Add(valueText);
 
             var muted = entry.IsMuted;
-            void ApplyMuteVisual()
+            var suppressSliderWrite = false;
+            // Popup anchors can outlive a refreshed AppEntry snapshot.
+            AppEntry CurrentPopupEntry() => _ctrl?.AppEntries.FirstOrDefault(current =>
+                string.Equals(current.ExePath, entry.ExePath, StringComparison.OrdinalIgnoreCase)) ?? entry;
+            void ReconcilePopup(bool succeeded)
             {
-                valueText.Text = muted ? "0%" : $"{slider.Value:F0}%";
-                valueText.Foreground = muted ? mutedBrush : accent;
-                slider.IsEnabled = !muted;
-                iconBorder.BorderBrush = muted ? mutedBrush : Brushes.Transparent;
-                iconBorder.BorderThickness = muted ? new Thickness(1) : new Thickness(0);
-                iconBorder.Child = MakeIconElement(entry.ExePath, entry.IconBytes, muted);
+                suppressSliderWrite = true;
+                try
+                {
+                    var current = CurrentPopupEntry();
+                    ReconcileAudioControlUi(current, slider, valueText, iconBorder,
+                        accent, mutedBrush, current.IconBytes, failed: !succeeded);
+                    muted = current.IsMuted;
+                }
+                finally { suppressSliderWrite = false; }
             }
-
             iconBorder.MouseLeftButtonUp += (_, _) =>
             {
-                muted = !muted;
-                _ctrl.SetMute(entry.ControlKey, muted);
-                ApplyMuteVisual();
+                var current = CurrentPopupEntry();
+                var accepted = _ctrl?.TrySetMute(current.ExePath, !current.IsMuted) == true;
+                ReconcilePopup(accepted);
             };
 
             slider.GotMouseCapture += (_, _) => _isUserInteracting = true;
             slider.LostMouseCapture += (_, _) => _isUserInteracting = false;
             slider.ValueChanged += (_, _) =>
             {
-                if (_isRefreshing || muted)
-                {
-                    return;
-                }
-
-                _ctrl.SetVolume(entry.ControlKey, (float)(slider.Value / 100.0));
-                valueText.Text = $"{slider.Value:F0}%";
+                if (_isRefreshing || muted || suppressSliderWrite) return;
+                var accepted = _ctrl?.TrySetVolume(entry.ExePath, (float)(slider.Value / 100.0)) == true;
+                ReconcilePopup(accepted);
             };
-
             popupBorder.PreviewMouseLeftButtonDown += (_, e) =>
             {
                 var source = e.OriginalSource as DependencyObject;
@@ -4465,7 +4220,10 @@ namespace MiniMixerOverlay.App
                     _activeAppPopup = null;
                 }
 
-                Refresh();
+                if (!_isRefreshing)
+                {
+                    Refresh();
+                }
             };
 
             _activeAppPopup = popup;
@@ -4478,30 +4236,90 @@ namespace MiniMixerOverlay.App
                 return;
             }
 
+            // The popup is anchored to an icon in this strip. Replacing the icon
+            // during a mute/unmute refresh briefly sends WPF's popup elsewhere.
+            // Reuse the same element while its application and position are stable.
+            var retainIcons = displayedEntries.Count > 0 &&
+                _activeAppsStrip.Children.Count == displayedEntries.Count;
+            if (retainIcons)
+            {
+                for (var i = 0; i < displayedEntries.Count; i++)
+                {
+                    if (_activeAppsStrip.Children[i] is not Border icon ||
+                        icon.Tag is not AppEntry oldEntry ||
+                        !string.Equals(oldEntry.ExePath, displayedEntries[i].ExePath,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        retainIcons = false;
+                        break;
+                    }
+                }
+            }
+
+            if (retainIcons)
+            {
+                for (var i = 0; i < displayedEntries.Count; i++)
+                {
+                    var entry = displayedEntries[i];
+                    var icon = (Border)_activeAppsStrip.Children[i];
+                    icon.Tag = entry;
+                    icon.BorderBrush = entry.IsMuted
+                        ? new SolidColorBrush(Color.FromRgb(255, 107, 107))
+                        : new SolidColorBrush(Color.FromArgb(110, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B));
+                    icon.ToolTip = $"{entry.DisplayName} ({(entry.IsMuted ? "Mute" : $"{entry.CombinedVolume * 100f:F0}%")})";
+                    icon.Child = MakeIconElement(entry.ExePath, entry.IconBytes, entry.IsMuted);
+                }
+                return;
+            }
+
+            // An actual change of icon order/identity cannot keep the old anchor.
+            // Close that popup deliberately before removing its placement target.
+            if (_activeAppPopup is { IsOpen: true } &&
+                _activeAppPopup.PlacementTarget is UIElement target &&
+                _activeAppsStrip.Children.Contains(target))
+            {
+                CloseActiveAppPopup();
+            }
+
+            // Keep unchanged icon elements (especially pinned master) when
+            // foreground order changes. Any open popup is closed above before
+            // its anchor is reparented.
+            var previousIcons = _activeAppsStrip.Children.OfType<Border>()
+                .Where(icon => icon.Tag is AppEntry)
+                .GroupBy(icon => ((AppEntry)icon.Tag).ExePath, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
             _activeAppsStrip.Children.Clear();
             foreach (var entry in displayedEntries)
             {
                 var muted = entry.IsMuted;
-                var iconButton = new Border
+                if (!previousIcons.TryGetValue(entry.ExePath, out var iconButton))
                 {
-                    Width = 22,
-                    Height = 22,
-                    Margin = new Thickness(2, 0, 2, 0),
-                    CornerRadius = new CornerRadius(6),
-                    Background = new SolidColorBrush(Color.FromArgb(160, 20, 34, 56)),
-                    BorderBrush = muted
-                        ? new SolidColorBrush(Color.FromRgb(255, 107, 107))
-                        : new SolidColorBrush(Color.FromArgb(110, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B)),
-                    BorderThickness = new Thickness(1),
-                    Cursor = Cursors.Hand,
-                    ToolTip = $"{entry.DisplayName} · {entry.OutputDeviceName} ({(muted ? "Mute" : $"{entry.CombinedVolume * 100f:F0}%")})"
-                };
+                    iconButton = new Border
+                    {
+                        Width = 22,
+                        Height = 22,
+                        Margin = new Thickness(2, 0, 2, 0),
+                        CornerRadius = new CornerRadius(6),
+                        Background = new SolidColorBrush(Color.FromArgb(160, 20, 34, 56)),
+                        BorderThickness = new Thickness(1),
+                        Cursor = Cursors.Hand
+                    };
+                    var clickTarget = iconButton;
+                    iconButton.MouseLeftButtonUp += (_, _) =>
+                    {
+                        if (clickTarget.Tag is AppEntry current)
+                            ShowActiveAppPopup(current, clickTarget);
+                    };
+                }
 
+                iconButton.Tag = entry;
+                iconButton.BorderBrush = muted
+                    ? new SolidColorBrush(Color.FromRgb(255, 107, 107))
+                    : new SolidColorBrush(Color.FromArgb(110, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B));
+                iconButton.ToolTip = $"{entry.DisplayName} ({(muted ? "Mute" : $"{entry.CombinedVolume * 100f:F0}%")})";
                 iconButton.Child = MakeIconElement(entry.ExePath, entry.IconBytes, muted);
-                iconButton.MouseLeftButtonUp += (_, _) => ShowActiveAppPopup(entry, iconButton);
                 _activeAppsStrip.Children.Add(iconButton);
             }
-
             if (displayedEntries.Count == 0)
             {
                 _activeAppsStrip.Children.Add(new TextBlock
@@ -4513,6 +4331,71 @@ namespace MiniMixerOverlay.App
                     Margin = new Thickness(4, 0, 0, 0)
                 });
             }
+        }
+
+        private static bool IsSystemSoundsEntry(AppEntry entry) =>
+            string.Equals(entry.ExePath, "__system_sound__", StringComparison.OrdinalIgnoreCase);
+
+        private static List<AppEntry> OrderMixerEntries(IEnumerable<AppEntry> candidates, AppEntry? foreground)
+        {
+            var ordered = candidates
+                .OrderBy(entry => IsMasterVolumeEntry(entry) ? 0 : 1)
+                .ThenBy(entry => entry.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+                .ToList();
+
+            if (foreground == null || IsMasterVolumeEntry(foreground) || IsSystemSoundsEntry(foreground))
+            {
+                return ordered;
+            }
+
+            var selected = ordered.FirstOrDefault(entry =>
+                string.Equals(entry.ExePath, foreground.ExePath, StringComparison.OrdinalIgnoreCase));
+            if (selected != null)
+            {
+                ordered.Remove(selected);
+                ordered.Insert(ordered.Any(IsMasterVolumeEntry) ? 1 : 0, selected);
+            }
+            return ordered;
+        }
+
+        private static List<AppEntry> OrderMainCardEntries(IEnumerable<AppEntry> eligible, AppEntry? foreground)
+        {
+            // The full card view is foreground-first. Master is only the
+            // first card when no matching foreground audio app is available.
+            // The bottom icon strip deliberately keeps its own master-first
+            // order: do not change OrderMixerEntries for this preference.
+            var ordered = eligible.ToList();
+            if (foreground != null && !IsMasterVolumeEntry(foreground) && !IsSystemSoundsEntry(foreground))
+            {
+                var selected = ordered.FirstOrDefault(entry =>
+                    string.Equals(entry.ExePath, foreground.ExePath, StringComparison.OrdinalIgnoreCase));
+                if (selected != null)
+                {
+                    ordered.Remove(selected);
+                    ordered.Insert(0, selected);
+                }
+            }
+            return ordered;
+        }
+
+        // Settings deliberately pause the normal audio/session poll while the
+        // user is editing. Preview UI-only changes from the cached snapshot,
+        // coalesced to one dispatcher turn (no extra timer or audio writes).
+        private static bool _settingsPreviewRefreshQueued;
+
+        private static void QueueSettingsUiPreviewRefresh()
+        {
+            if (_settingsWin == null || _ctrl == null || _appList == null ||
+                _settingsPreviewRefreshQueued)
+                return;
+
+            _settingsPreviewRefreshQueued = true;
+            _settingsWin.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _settingsPreviewRefreshQueued = false;
+                if (_settingsWin != null && _ctrl != null && _appList != null && !_isRefreshing)
+                    Refresh(); // _settingsWin != null prevents session polling
+            }), DispatcherPriority.Background);
         }
 
         private static void Refresh()
@@ -4548,74 +4431,63 @@ namespace MiniMixerOverlay.App
                     }
                 }
 
-                var showOnlyActive = false;
+                var showOnlyActive = _ctrl.Settings.Ui.ShowOnlyActiveAudio;
                 var maxVisible = GetEffectiveVisibleApps();
 
                 _appList.Children.Clear();
                 var displayedEntries = new List<AppEntry>();
                 var stripEntries = new List<AppEntry>();
 
-                var preferSystemFallbackFirst = true;
-                try
-                {
-                    if (GameHookBridge.TryGetForegroundWindowInfo(out var foregroundInfo) && IsOverlayForeground(foregroundInfo))
-                    {
-                        preferSystemFallbackFirst = false;
-                    }
-                }
-                catch
-                {
-                    // keep default fallback behavior
-                }
-
-                var entries = _ctrl.AppEntries
-                    .OrderBy(entry => IsSystemSoundEntry(entry)
-                        ? (preferSystemFallbackFirst ? 0 : 2)
-                        : 1)
-                    .ThenBy(entry => entry.DisplayName, StringComparer.CurrentCultureIgnoreCase)
-                    .ToList();
-
-                var systemEntry = entries.FirstOrDefault(IsSystemSoundEntry);
                 var foregroundEntry = TryFindForegroundAudioEntrySafe();
-
-                var foregroundNonSystemEntry = foregroundEntry != null && !IsSystemSoundEntry(foregroundEntry)
+                var foregroundNonSystemEntry = foregroundEntry != null &&
+                    !IsMasterVolumeEntry(foregroundEntry) &&
+                    !IsSystemSoundsEntry(foregroundEntry)
                     ? foregroundEntry
                     : null;
-
-                // Vordergrund-App kommt fuer schnelle Bedienung ganz nach vorne.
-                // Falls keine Vordergrund-App erkannt wird, bleibt "Lautstaerke" zuerst.
                 if (foregroundNonSystemEntry != null)
                 {
                     RememberForegroundAudioEntry(foregroundNonSystemEntry);
-                    entries.Remove(foregroundNonSystemEntry);
-                    entries.Insert(0, foregroundNonSystemEntry);
                 }
+
+                // One ordering owner for both the full cards and compact icon strip:
+                // the actual default endpoint master is pinned first, the foreground
+                // app second, followed by other eligible audio apps.
+                var entries = OrderMixerEntries(_ctrl.AppEntries, foregroundNonSystemEntry);
+                var systemEntry = entries.FirstOrDefault(IsMasterVolumeEntry);
 
                 var collapsedDockSingleCardMode = _edgeDockEnabled && _edgeDockActive && !_edgeDockExpanded;
                 var preferredCollapsedEntry = foregroundNonSystemEntry ?? systemEntry ?? entries.FirstOrDefault();
-
-                foreach (var entry in entries)
+                if (showOnlyActive && preferredCollapsedEntry != null &&
+                    !preferredCollapsedEntry.HasActiveAudio && !preferredCollapsedEntry.IsMuted &&
+                    !IsMasterVolumeEntry(preferredCollapsedEntry))
                 {
-                    if (showOnlyActive && !entry.HasActiveAudio && !entry.IsMuted)
-                    {
-                        continue;
-                    }
+                    // Keep the compact dock usable when the preferred app is filtered out.
+                    preferredCollapsedEntry = entries.FirstOrDefault(entry => entry.HasActiveAudio || entry.IsMuted);
+                }
 
-                    if (stripEntries.Count < 24)
-                    {
-                        stripEntries.Add(entry);
-                    }
+                // Independently select cards and strip icons from the same
+                // filtered sessions. The strip stays pinned master-first; the
+                // card view puts the current app first and obeys Visible Apps.
+                var eligibleEntries = entries.Where(entry =>
+                    !showOnlyActive || entry.HasActiveAudio || entry.IsMuted ||
+                    IsMasterVolumeEntry(entry) ||
+                    (foregroundNonSystemEntry != null &&
+                     string.Equals(entry.ExePath, foregroundNonSystemEntry.ExePath,
+                         StringComparison.OrdinalIgnoreCase))).ToList();
+                stripEntries.AddRange(eligibleEntries.Take(24));
 
-                    if (maxVisible <= 0)
+                foreach (var entry in OrderMainCardEntries(eligibleEntries, foregroundNonSystemEntry))
+                {
+                    if (maxVisible <= 0 || displayedEntries.Count >= maxVisible)
                     {
-                        continue;
+                        break;
                     }
 
                     if (collapsedDockSingleCardMode)
                     {
                         if (preferredCollapsedEntry != null &&
                             !ReferenceEquals(entry, preferredCollapsedEntry) &&
-                            !string.Equals(entry.ControlKey, preferredCollapsedEntry.ControlKey, StringComparison.OrdinalIgnoreCase))
+                            !string.Equals(entry.ExePath, preferredCollapsedEntry.ExePath, StringComparison.OrdinalIgnoreCase))
                         {
                             continue;
                         }
@@ -4658,6 +4530,26 @@ namespace MiniMixerOverlay.App
             }
         }
 
+        // A rejected or partially accepted command is not a confirmed UI state.
+        // Callers suppress Slider.ValueChanged while restoring the last snapshot.
+        private static void ReconcileAudioControlUi(
+            AppEntry entry, Slider slider, TextBlock volumeText, Border icon,
+            Brush accent, Brush mutedBrush, byte[]? iconBytes, bool failed)
+        {
+            var muted = entry.IsMuted;
+            slider.Value = Math.Clamp(entry.CombinedVolume * 100f, 0f, 100f);
+            slider.IsEnabled = !muted;
+            volumeText.Text = (muted ? "0%" : $"{slider.Value:F0}%") +
+                (failed ? " !" : string.Empty);
+            volumeText.Foreground = (muted || failed) ? mutedBrush : accent;
+            volumeText.ToolTip = failed
+                ? Ui("Audio-Befehl nicht bestaetigt – letzter bekannter Wert", "Audio command not confirmed – last known value")
+                : null;
+            icon.BorderBrush = (muted || failed) ? mutedBrush : Brushes.Transparent;
+            icon.BorderThickness = (muted || failed) ? new Thickness(1) : new Thickness(0);
+            icon.Child = MakeIconElement(entry.ExePath, iconBytes, muted);
+        }
+
         private static Border BuildCard(AppEntry entry)
         {
             var accent = new SolidColorBrush(_activeGlassAccent);
@@ -4668,7 +4560,6 @@ namespace MiniMixerOverlay.App
             var cardMuted = entry.IsMuted;
             var volumePercent = entry.CombinedVolume * 100f;
             var exePath = entry.ExePath;
-            var controlKey = entry.ControlKey;
             var iconBytes = entry.IconBytes;
             var quickDockMode = _edgeDockEnabled && _edgeDockActive && !_edgeDockExpanded;
 
@@ -4688,7 +4579,7 @@ namespace MiniMixerOverlay.App
                 var compactPanel = new StackPanel
                 {
                     Width = Math.Clamp(_edgeDockVisibleWidth - 14, 26, 96),
-                    HorizontalAlignment = _edgeDockSide == "left" ? HorizontalAlignment.Left : HorizontalAlignment.Right,
+                    HorizontalAlignment = _edgeDockSide == "left" ? HorizontalAlignment.Right : HorizontalAlignment.Left,
                     VerticalAlignment = VerticalAlignment.Center
                 };
 
@@ -4720,7 +4611,7 @@ namespace MiniMixerOverlay.App
                 {
                     Minimum = 0,
                     Maximum = 100,
-                    Value = cardMuted ? 0 : volumePercent,
+                    Value = volumePercent,
                     Orientation = Orientation.Vertical,
                     Foreground = accent,
                     Height = 50,
@@ -4729,34 +4620,33 @@ namespace MiniMixerOverlay.App
                     IsEnabled = !cardMuted
                 };
 
+                var suppressQuickSliderWrite = false;
+                void ReconcileQuick(bool succeeded)
+                {
+                    suppressQuickSliderWrite = true;
+                    try
+                    {
+                        ReconcileAudioControlUi(entry, quickSlider, quickVolText, quickIconBorder,
+                            accent, mutFgClr, iconBytes, failed: !succeeded);
+                        cardMuted = entry.IsMuted;
+                    }
+                    finally { suppressQuickSliderWrite = false; }
+                }
                 void ToggleQuickMute()
                 {
-                    cardMuted = !cardMuted;
-                    _ctrl?.SetMute(controlKey, cardMuted);
-
-                    quickVolText.Text = cardMuted ? "0%" : quickSlider.Value.ToString("F0") + "%";
-                    quickVolText.Foreground = cardMuted ? mutFgClr : accent;
-                    quickSlider.IsEnabled = !cardMuted;
-                    quickIconBorder.BorderThickness = cardMuted ? new Thickness(1) : new Thickness(0);
-                    quickIconBorder.BorderBrush = cardMuted ? mutFgClr : Brushes.Transparent;
-                    quickIconBorder.Child = MakeIconElement(exePath, iconBytes, cardMuted);
+                    var accepted = _ctrl?.TrySetMute(exePath, !entry.IsMuted) == true;
+                    ReconcileQuick(accepted);
                 }
 
                 quickIconBorder.MouseLeftButtonUp += (_, _) => ToggleQuickMute();
-
                 quickSlider.GotMouseCapture += (_, _) => _isUserInteracting = true;
                 quickSlider.LostMouseCapture += (_, _) => _isUserInteracting = false;
                 quickSlider.ValueChanged += (_, _) =>
                 {
-                    if (_isRefreshing || cardMuted)
-                    {
-                        return;
-                    }
-
-                    quickVolText.Text = quickSlider.Value.ToString("F0") + "%";
-                    _ctrl?.SetVolume(controlKey, (float)(quickSlider.Value / 100.0));
+                    if (_isRefreshing || cardMuted || suppressQuickSliderWrite) return;
+                    var accepted = _ctrl?.TrySetVolume(exePath, (float)(quickSlider.Value / 100.0)) == true;
+                    ReconcileQuick(accepted);
                 };
-
                 compactPanel.Children.Add(quickIconBorder);
                 compactPanel.Children.Add(quickVolText);
                 compactPanel.Children.Add(quickSlider);
@@ -4813,7 +4703,13 @@ namespace MiniMixerOverlay.App
 
             var exeText = new TextBlock
             {
-                Text = BuildEntrySubtitle(entry),
+                Text = entry.ExeName + BuildRuleStatusSuffix(entry.Rule) +
+                    (!entry.IsMuted && entry.SignalPeakLevel is > 0.005f
+                        ? " | " + Ui("Ton", "Signal") : string.Empty),
+                ToolTip = entry.SignalPeakLevel is float peak
+                    ? Ui("Gemessener Signalpegel (Momentaufnahme): ", "Measured signal peak (snapshot): ") +
+                      $"{peak * 100f:F0}%"
+                    : Ui("Kein Signalpegel verfügbar", "Audio meter unavailable"),
                 Foreground = dimClr,
                 FontSize = 9,
                 TextTrimming = TextTrimming.CharacterEllipsis,
@@ -4839,7 +4735,7 @@ namespace MiniMixerOverlay.App
             {
                 Minimum = 0,
                 Maximum = 100,
-                Value = cardMuted ? 0 : volumePercent,
+                Value = volumePercent,
                 Foreground = accent,
                 Height = 20,
                 Margin = new Thickness(0, 2, 0, 0),
@@ -4849,73 +4745,114 @@ namespace MiniMixerOverlay.App
             Grid.SetRow(slider, 1);
             g.Children.Add(slider);
 
+            var suppressNormalSliderWrite = false;
+            void ReconcileNormal(bool succeeded)
+            {
+                suppressNormalSliderWrite = true;
+                try
+                {
+                    ReconcileAudioControlUi(entry, slider, volText, iconBorder,
+                        accent, mutFgClr, iconBytes, failed: !succeeded);
+                    cardMuted = entry.IsMuted;
+                }
+                finally { suppressNormalSliderWrite = false; }
+            }
             void ToggleMute()
             {
-                cardMuted = !cardMuted;
-                _ctrl?.SetMute(controlKey, cardMuted);
-
-                volText.Text = cardMuted ? "0%" : slider.Value.ToString("F0") + "%";
-                volText.Foreground = cardMuted ? mutFgClr : accent;
-                slider.IsEnabled = !cardMuted;
-                iconBorder.BorderThickness = cardMuted ? new Thickness(1) : new Thickness(0);
-                iconBorder.BorderBrush = cardMuted ? mutFgClr : Brushes.Transparent;
-                iconBorder.Child = MakeIconElement(exePath, iconBytes, cardMuted);
+                var accepted = _ctrl?.TrySetMute(exePath, !entry.IsMuted) == true;
+                ReconcileNormal(accepted);
             }
-
             iconBorder.MouseLeftButtonUp += (_, _) => ToggleMute();
-
             slider.GotMouseCapture += (_, _) => _isUserInteracting = true;
             slider.LostMouseCapture += (_, _) => _isUserInteracting = false;
-
             slider.ValueChanged += (_, _) =>
             {
-                if (_isRefreshing || cardMuted)
-                {
-                    return;
-                }
-
-                volText.Text = slider.Value.ToString("F0") + "%";
-                _ctrl?.SetVolume(controlKey, (float)(slider.Value / 100.0));
+                if (_isRefreshing || cardMuted || suppressNormalSliderWrite) return;
+                var accepted = _ctrl?.TrySetVolume(exePath, (float)(slider.Value / 100.0)) == true;
+                ReconcileNormal(accepted);
             };
-
             card.Child = g;
             return card;
         }
 
-        private static string BuildEntrySubtitle(AppEntry entry)
+        private static string BuildRuleStatusSuffix(AppRule? rule)
         {
-            var parts = new List<string>();
-            if (!string.IsNullOrWhiteSpace(entry.ExeName))
+            if (rule == null)
             {
-                parts.Add(entry.ExeName);
-            }
-
-            if (!string.IsNullOrWhiteSpace(entry.OutputDeviceName) && !entry.IsSystemSound)
-            {
-                parts.Add(entry.OutputDeviceName);
+                return string.Empty;
             }
 
             var flags = new List<string>();
-            var rule = entry.Rule;
-            if (rule != null)
-            {
-                if (rule.Favorite) flags.Add("FAV");
-                if (rule.Locked) flags.Add("LOCK");
+            if (rule.Favorite) flags.Add("FAV");
+            if (rule.Locked) flags.Add("LOCK");
+            if (rule.ManualOverride) flags.Add("MANUAL");
+            else if (rule.AutoApplied) flags.Add("AUTO");
 
-                if (rule.DeviceProfiles != null &&
-                    rule.DeviceProfiles.TryGetValue(OutputDeviceIdentity.Normalize(entry.OutputDeviceId), out var profile))
-                {
-                    if (profile.ManualOverride) flags.Add("MANUAL");
-                    else if (profile.AutoApplied) flags.Add("AUTO");
-                }
-            }
-
-            var baseText = string.Join(" · ", parts);
-            return flags.Count == 0 ? baseText : baseText + " | " + string.Join(" ", flags);
+            return flags.Count == 0 ? string.Empty : " | " + string.Join(" ", flags);
         }
 
+        private static UIElement MakeSystemAudioIcon(bool isMaster, bool muted)
+        {
+            var drawing = new Canvas { Width = 24, Height = 24 };
+            if (isMaster)
+            {
+                drawing.Children.Add(new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 3,9 L 7,9 L 12,5 L 12,19 L 7,15 L 3,15 Z"),
+                    Fill = Brushes.White
+                });
+                drawing.Children.Add(new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 15,9 C 17,11 17,13 15,15 M 17,6 C 21,9 21,15 17,18"),
+                    Stroke = Brushes.White,
+                    StrokeThickness = 1.6,
+                    StrokeStartLineCap = PenLineCap.Round,
+                    StrokeEndLineCap = PenLineCap.Round
+                });
+            }
+            else
+            {
+                // Two filled noteheads, stems, and a connecting beam.
+                foreach (var (left, top) in new[] { (3.0, 16.0), (14.0, 13.0) })
+                {
+                    var head = new System.Windows.Shapes.Ellipse
+                    {
+                        Width = 7, Height = 5, Fill = Brushes.White
+                    };
+                    Canvas.SetLeft(head, left);
+                    Canvas.SetTop(head, top);
+                    drawing.Children.Add(head);
+                }
+                drawing.Children.Add(new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 9,18 L 9,5 M 20,15 L 20,2"),
+                    Stroke = Brushes.White,
+                    StrokeThickness = 2
+                });
+                drawing.Children.Add(new System.Windows.Shapes.Path
+                {
+                    Data = Geometry.Parse("M 9,5 L 20,2 L 20,6 L 9,9 Z"),
+                    Fill = Brushes.White
+                });
+            }
+            var icon = new Viewbox
+            {
+                Width = 19, Height = 19, Stretch = Stretch.Uniform,
+                Opacity = muted ? 0.55 : 1.0,
+                Child = drawing
+            };
+            System.Windows.Automation.AutomationProperties.SetName(icon,
+                isMaster ? Ui("Systemlautstaerke", "System volume") : Ui("Systemtoene", "System sounds"));
+            return icon;
+        }
         private static UIElement MakeIconElement(string exePath, byte[]? iconBytes, bool muted)
         {
+            // System audio uses explicit white vector icons in both displays.
+            if (string.Equals(exePath, "__system_master__", StringComparison.OrdinalIgnoreCase))
+                return MakeSystemAudioIcon(isMaster: true, muted);
+            if (string.Equals(exePath, "__system_sound__", StringComparison.OrdinalIgnoreCase))
+                return MakeSystemAudioIcon(isMaster: false, muted);
+
             BitmapImage? bmp = null;
 
             if (!string.IsNullOrWhiteSpace(exePath))
@@ -4969,2523 +4906,9 @@ namespace MiniMixerOverlay.App
                 Opacity = muted ? 0.65 : 1.0
             };
         }
-        private static void ShowSettings()
-        {
-            if (_settingsWin != null)
-            {
-                _settingsWin.Activate();
-                return;
-            }
-
-            var win = new Window
-            {
-                Title = Ui("Einstellungen", "Settings"),
-                Width = 320,
-                Height = 620,
-                WindowStyle = WindowStyle.None,
-                AllowsTransparency = true,
-                Background = Brushes.Transparent,
-                Topmost = _mainWin?.Topmost ?? true,
-                ResizeMode = ResizeMode.NoResize,
-                ShowInTaskbar = false
-            };
-
-            if (_mainWin != null)
-            {
-                win.Owner = _mainWin;
-            }
-
-            win.MouseEnter += (_, _) => _isUserInteracting = true;
-            win.MouseLeave += (_, _) => _isUserInteracting = false;
-
-            var outer = BuildGlassPanel();
-            _settingsGlassBorder = outer;
-            ApplyGlassTheme();
-            var sp = new StackPanel
-            {
-                Margin = new Thickness(18, 14, 18, 14)
-            };
-            var settingsScroll = new ScrollViewer
-            {
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                Content = sp
-            };
-            Style? sliderTemplateStyle = null;
-            Style? comboTemplateStyle = null;
-            Style? comboItemTemplateStyle = null;
-            Style? actionButtonStyle = null;
-            var isSyncingOverlayModeCombo = false;
-            var isSyncingDockSideCombo = false;
-            Slider? widthSliderRef = null;
-            TextBlock? widthLblRef = null;
-
-            var hg = new Grid();
-            hg.Children.Add(new TextBlock
-            {
-                Text = Ui("\u2699  Einstellungen", "\u2699  Settings"),
-                Foreground = Brushes.White,
-                FontSize = 14,
-                FontWeight = FontWeights.SemiBold,
-                VerticalAlignment = VerticalAlignment.Center
-            });
-
-            var closeBtn = new Button
-            {
-                Content = "\u2715",
-                Width = 24,
-                Height = 24,
-                Background = Brushes.Transparent,
-                BorderBrush = Brushes.Transparent,
-                Foreground = new SolidColorBrush(Color.FromRgb(200, 200, 220)),
-                FontSize = 12,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Cursor = Cursors.Hand
-            };
-            closeBtn.Click += (_, _) =>
-            {
-                _isUserInteracting = false;
-                _settingsWin = null;
-                _settingsGlassBorder = null;
-                _settingsGameHookStatusTxt = null;
-                win.Close();
-            };
-
-            hg.Children.Add(closeBtn);
-            sp.Children.Add(hg);
-            sp.Children.Add(new Separator
-            {
-                Background = new SolidColorBrush(Color.FromArgb(80, 80, 80, 120)),
-                Margin = new Thickness(0, 6, 0, 8)
-            });
-
-            var infoText = new TextBlock
-            {
-                Text = Ui(
-                    "Rand-Andocken blendet das Fenster unaufallig am linken/rechten Rand ein und aus.",
-                    "Edge docking subtly hides/shows the window at the left/right edge."),
-                Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 210)),
-                FontSize = 10,
-                Margin = new Thickness(0, 0, 0, 8),
-                TextWrapping = TextWrapping.Wrap
-            };
-            sp.Children.Add(infoText);
-
-            var languageToolsLine = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                Margin = new Thickness(0, 0, 0, 8)
-            };
-
-            var btnLanguage = new Button
-            {
-                Content = FormatNextLanguageButtonLabel(),
-                Height = 28,
-                Padding = new Thickness(10, 0, 10, 0),
-                Margin = new Thickness(0, 0, 6, 0),
-                Cursor = Cursors.Hand
-            };
-            ApplyActionButtonTheme(btnLanguage);
-            AttachOptionLegend(btnLanguage, Ui("Wechselt zur naechsten Sprache in der Liste.", "Switches to the next language in the list."));
-            btnLanguage.Click += (_, _) =>
-            {
-                var nextLanguage = GetNextUiLanguageCode(_uiLanguage);
-                SetUiLanguage(nextLanguage);
-            };
-            languageToolsLine.Children.Add(btnLanguage);
-            sp.Children.Add(languageToolsLine);
-
-            var chkAuto = new CheckBox
-            {
-                Content = Ui("Autostart mit Windows", "Start with Windows"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4)
-            };
-            ApplyCheckTheme(chkAuto);
-            AttachOptionLegend(chkAuto, "Startet Mini Mixer Overlay automatisch mit Windows.");
-
-            try
-            {
-                using var k = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run");
-                chkAuto.IsChecked = k?.GetValue("MiniMixerOverlay") != null;
-            }
-            catch
-            {
-                // ignore
-            }
-
-            chkAuto.Click += (_, _) =>
-            {
-                try
-                {
-                    using var k = Registry.CurrentUser.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run");
-                    if (chkAuto.IsChecked == true)
-                    {
-                        var exePath = GetCurrentExecutablePath();
-                        if (!string.IsNullOrWhiteSpace(exePath))
-                        {
-                            k.SetValue("MiniMixerOverlay", $"\"{exePath}\"");
-                        }
-                    }
-                    else
-                    {
-                        k.DeleteValue("MiniMixerOverlay", false);
-                    }
-
-                }
-                catch
-                {
-                    // ignore
-                }
-            };
-            sp.Children.Add(chkAuto);
-
-            var chkTop = new CheckBox
-            {
-                Content = Ui("Immer im Vordergrund", "Always on top"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _userAlwaysOnTop
-            };
-            ApplyCheckTheme(chkTop);
-            AttachOptionLegend(chkTop, "Haelt Overlay und Einstellungen immer ueber anderen Fenstern.");
-            chkTop.Click += (_, _) =>
-            {
-                var isTop = chkTop.IsChecked == true;
-                _userAlwaysOnTop = isTop;
-                if (_mainWin != null)
-                {
-                    _mainWin.Topmost = IsDesktopOverlayMode() ? isTop : true;
-                }
-                if (_settingsWin != null)
-                {
-                    _settingsWin.Topmost = IsDesktopOverlayMode() ? isTop : true;
-                }
-                if (_cornerHintWin != null)
-                {
-                    _cornerHintWin.Topmost = true;
-                    EnsureCornerHintOnTop();
-                }
-                if (_ctrl != null) _ctrl.Settings.Window.AlwaysOnTop = isTop;
-            };
-            sp.Children.Add(chkTop);
-
-            var chkHoverFront = new CheckBox
-            {
-                Content = Ui("Bei Hover in den Vordergrund", "Bring to front on hover"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 6),
-                IsChecked = _bringToFrontOnHover
-            };
-            ApplyCheckTheme(chkHoverFront);
-            AttachOptionLegend(chkHoverFront, "Bringt das Overlay beim Hover sofort nach vorne.");
-            chkHoverFront.Click += (_, _) =>
-            {
-                _bringToFrontOnHover = chkHoverFront.IsChecked == true;
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.BringToFrontOnHover = _bringToFrontOnHover;
-                }
-            };
-            // Simplified settings: hover-front behavior stays enabled by the saved/default policy,
-            // but is no longer exposed as a separate user-facing option.
-
-            sp.Children.Add(new TextBlock
-            {
-                Text = Ui("Overlay-Modus:", "Overlay mode:"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            });
-
-            var overlayModeCombo = new ComboBox
-            {
-                Height = 28,
-                Margin = new Thickness(0, 0, 0, 4),
-                ItemsSource = new[] { "Desktop Overlay", "Game-Hook (Experimental)" },
-                SelectedIndex = IsDesktopOverlayMode() ? 0 : 1
-            };
-            AttachOptionLegend(overlayModeCombo, "Desktop: klassisches Fenster mit Docking. Game-Hook: Ingame-Overlay mit Auto-Erkennung.");
-            sp.Children.Add(overlayModeCombo);
-
-            var overlayModeHintLbl = new TextBlock
-            {
-                Text = IsDesktopOverlayMode()
-                    ? Ui("Desktop-Modus: Docking, Hover-Reveal und Glasfenster aktiv.", "Desktop mode: docking, hover reveal and glass window active.")
-                    : Ui("Game-Hook-Modus: Desktop-Docking pausiert, Injection-Werkzeuge aktiv.", "Game-hook mode: desktop docking paused, injection tools active."),
-                Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 210)),
-                FontSize = 10,
-                Margin = new Thickness(0, 0, 0, 6),
-                TextWrapping = TextWrapping.Wrap
-            };
-            sp.Children.Add(overlayModeHintLbl);
-
-            sp.Children.Add(new TextBlock
-            {
-                Text = Ui("Sichtbare Apps:", "Visible apps:"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 2, 0, 2)
-            });
-
-            var appsSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 12,
-                Value = _visibleApps,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = true
-            };
-            var appsLbl = new TextBlock
-            {
-                Text = FormatVisibleAppsLabel(_visibleApps),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            AttachOptionLegend(appsSlider, "Bestimmt, wie viele App-Karten maximal sichtbar sind. 0 zeigt nur die Icon-Leiste unten.");
-            appsSlider.ValueChanged += (_, _) =>
-            {
-                _visibleApps = (int)appsSlider.Value;
-                appsLbl.Text = FormatVisibleAppsLabel(_visibleApps);
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.VisibleApps = _visibleApps;
-                }
-
-                if (_mainWin != null)
-                {
-                    ApplyContextualMainWindowHeight();
-                }
-            };
-            sp.Children.Add(appsSlider);
-            sp.Children.Add(appsLbl);
-
-            var gameHookControls = new List<UIElement>();
-            var gameHookAdvancedControls = new List<UIElement>();
-
-            void AddGameHookControl(UIElement control)
-            {
-                gameHookControls.Add(control);
-                sp.Children.Add(control);
-            }
-
-            void AddGameHookAdvancedControl(UIElement control)
-            {
-                gameHookAdvancedControls.Add(control);
-                AddGameHookControl(control);
-            }
-
-            var gameHookTitleBox = new TextBox
-            {
-                Height = 28,
-                Margin = new Thickness(0, 0, 0, 4),
-                Text = _gameHookTargetWindowTitle
-            };
-            var gameHookTitleLbl = new TextBlock
-            {
-                Text = Ui("Game-Fenster Titel (Teilstring):", "Game window title (substring):"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            };
-            AddGameHookAdvancedControl(gameHookTitleLbl);
-            AddGameHookAdvancedControl(gameHookTitleBox);
-
-            var gameHookAssetsBox = new TextBox
-            {
-                Height = 28,
-                Margin = new Thickness(0, 0, 0, 4),
-                Text = _gameHookAssetsPath
-            };
-            var gameHookAssetsLbl = new TextBlock
-            {
-                Text = Ui("Game-Hook Assets Pfad:", "Game-hook assets path:"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            };
-            AddGameHookAdvancedControl(gameHookAssetsLbl);
-            AddGameHookAdvancedControl(gameHookAssetsBox);
-
-            Button MakeActionButton(string text)
-            {
-                var button = new Button
-                {
-                    Content = text,
-                    Height = 28,
-                    Margin = new Thickness(0, 0, 6, 0),
-                    Cursor = Cursors.Hand
-                };
-                ApplyActionButtonTheme(button);
-                return button;
-            }
-
-            var gameHookActions = new Grid { Margin = new Thickness(0, 0, 0, 4) };
-            gameHookActions.ColumnDefinitions.Add(new ColumnDefinition());
-            gameHookActions.ColumnDefinitions.Add(new ColumnDefinition());
-            var btnHookCheck = MakeActionButton(Ui("Pfad pruefen", "Check path"));
-            var btnHookInject = MakeActionButton("Inject");
-            btnHookInject.Margin = new Thickness(6, 0, 0, 0);
-            Grid.SetColumn(btnHookCheck, 0);
-            Grid.SetColumn(btnHookInject, 1);
-            gameHookActions.Children.Add(btnHookCheck);
-            gameHookActions.Children.Add(btnHookInject);
-            AddGameHookAdvancedControl(gameHookActions);
-
-            var gameHookStatusLbl = new TextBlock
-            {
-                Text = _gameHookRuntime?.IsRunning == true
-                    ? Ui("Game-Hook Runtime aktiv.", "Game-hook runtime active.")
-                    : Ui("Game-Hook bereit.", "Game-hook ready."),
-                Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 210)),
-                FontSize = 10,
-                Margin = new Thickness(0, 0, 0, 8),
-                TextWrapping = TextWrapping.Wrap
-            };
-            _settingsGameHookStatusTxt = gameHookStatusLbl;
-            AddGameHookAdvancedControl(gameHookStatusLbl);
-
-            var chkGameHookAutoRuntime = new CheckBox
-            {
-                Content = Ui("Runtime automatisch starten", "Start runtime automatically"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _gameHookAutoStartRuntime
-            };
-            ApplyCheckTheme(chkGameHookAutoRuntime);
-            AttachOptionLegend(chkGameHookAutoRuntime, "Startet die Hook-Runtime automatisch, sobald Game-Hook-Modus aktiv ist.");
-            AddGameHookAdvancedControl(chkGameHookAutoRuntime);
-
-            var chkGameHookForwardInput = new CheckBox
-            {
-                Content = Ui("Game-Input ins Overlay leiten", "Forward game input to overlay"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _gameHookForwardInput
-            };
-            ApplyCheckTheme(chkGameHookForwardInput);
-            AttachOptionLegend(chkGameHookForwardInput, "Leitet Eingaben aus dem Hook an das Overlay-Fenster weiter.");
-            AddGameHookAdvancedControl(chkGameHookForwardInput);
-
-            var gameHookRuntimeActions = new Grid { Margin = new Thickness(0, 0, 0, 8) };
-            gameHookRuntimeActions.ColumnDefinitions.Add(new ColumnDefinition());
-            gameHookRuntimeActions.ColumnDefinitions.Add(new ColumnDefinition());
-            gameHookRuntimeActions.ColumnDefinitions.Add(new ColumnDefinition());
-
-            var btnRuntimeStart = MakeActionButton(Ui("Runtime Start", "Start runtime"));
-            var btnRuntimeStop = MakeActionButton(Ui("Runtime Stop", "Stop runtime"));
-            var btnRuntimeIntercept = MakeActionButton(Ui("Input-Abfang: AUS", "Input intercept: OFF"));
-            btnRuntimeStop.Margin = new Thickness(6, 0, 6, 0);
-            btnRuntimeIntercept.Margin = new Thickness(0);
-            Grid.SetColumn(btnRuntimeStart, 0);
-            Grid.SetColumn(btnRuntimeStop, 1);
-            Grid.SetColumn(btnRuntimeIntercept, 2);
-            gameHookRuntimeActions.Children.Add(btnRuntimeStart);
-            gameHookRuntimeActions.Children.Add(btnRuntimeStop);
-            gameHookRuntimeActions.Children.Add(btnRuntimeIntercept);
-            AddGameHookAdvancedControl(gameHookRuntimeActions);
-
-            sp.Children.Add(new TextBlock
-            {
-                Text = Ui("Andocken:", "Docking:"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            });
-
-            var chkDock = new CheckBox
-            {
-                Content = Ui("Am Rand andocken", "Dock to screen edge"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _edgeDockEnabled
-            };
-            ApplyCheckTheme(chkDock);
-            AttachOptionLegend(chkDock, "Aktiviert Snap-Andocken am linken oder rechten Bildschirmrand.");
-            sp.Children.Add(chkDock);
-
-            void RefreshSettingsInputStyles()
-            {
-                sliderTemplateStyle = null;
-                comboTemplateStyle = null;
-                comboItemTemplateStyle = null;
-                actionButtonStyle = null;
-            }
-
-            void ApplySliderTheme(Slider slider)
-            {
-                if (sliderTemplateStyle == null)
-                {
-                    string Hex(Color c) => $"{c.R:X2}{c.G:X2}{c.B:X2}";
-                    var accent = Hex(_activeGlassAccent);
-                    var accentSoft = Hex(BlendColor(_activeGlassAccent, Colors.White, 0.18));
-                    var track = Hex(BlendColor(Color.FromRgb(32, 48, 71), _activeGlassAccent, 0.24));
-
-                    var xaml = $@"
-<ResourceDictionary
-    xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
-    xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-    <Style x:Key='GlassSliderFillButtonStyle' TargetType='RepeatButton'>
-        <Setter Property='Focusable' Value='False'/>
-        <Setter Property='IsTabStop' Value='False'/>
-        <Setter Property='Template'>
-            <Setter.Value>
-                <ControlTemplate TargetType='RepeatButton'>
-                    <Border Background='#D0{accentSoft}' Height='4' CornerRadius='2'/>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-    <Style x:Key='GlassSliderEmptyButtonStyle' TargetType='RepeatButton'>
-        <Setter Property='Focusable' Value='False'/>
-        <Setter Property='IsTabStop' Value='False'/>
-        <Setter Property='Template'>
-            <Setter.Value>
-                <ControlTemplate TargetType='RepeatButton'>
-                    <Border Background='Transparent' Height='4' CornerRadius='2'/>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-    <Style x:Key='GlassSliderThumbStyle' TargetType='Thumb'>
-        <Setter Property='Template'>
-            <Setter.Value>
-                <ControlTemplate TargetType='Thumb'>
-                    <Border Width='12' Height='20' CornerRadius='4'
-                            Background='#FF{accent}'
-                            BorderBrush='#FFEAF6FF'
-                            BorderThickness='1'/>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-    <Style x:Key='GlassSliderStyle' TargetType='Slider'>
-        <Setter Property='Foreground' Value='#FF{accent}'/>
-        <Setter Property='Background' Value='#9A{track}'/>
-        <Setter Property='Height' Value='20'/>
-        <Setter Property='Template'>
-            <Setter.Value>
-                <ControlTemplate TargetType='Slider'>
-                    <Grid Margin='0,2,0,2'>
-                        <Border Height='4' CornerRadius='2'
-                                Background='{{TemplateBinding Background}}'
-                                VerticalAlignment='Center'/>
-                        <Track x:Name='PART_Track'
-                               Minimum='{{TemplateBinding Minimum}}'
-                               Maximum='{{TemplateBinding Maximum}}'
-                               Value='{{TemplateBinding Value}}'
-                               VerticalAlignment='Center'>
-                            <Track.DecreaseRepeatButton>
-                                <RepeatButton Command='Slider.DecreaseLarge'
-                                              Style='{{StaticResource GlassSliderFillButtonStyle}}'/>
-                            </Track.DecreaseRepeatButton>
-                            <Track.Thumb>
-                                <Thumb Style='{{StaticResource GlassSliderThumbStyle}}'/>
-                            </Track.Thumb>
-                            <Track.IncreaseRepeatButton>
-                                <RepeatButton Command='Slider.IncreaseLarge'
-                                              Style='{{StaticResource GlassSliderEmptyButtonStyle}}'/>
-                            </Track.IncreaseRepeatButton>
-                        </Track>
-                    </Grid>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-</ResourceDictionary>";
-
-                    try
-                    {
-                        var dict = (ResourceDictionary)System.Windows.Markup.XamlReader.Parse(xaml);
-                        sliderTemplateStyle = dict["GlassSliderStyle"] as Style;
-                    }
-                    catch
-                    {
-                        sliderTemplateStyle = null;
-                    }
-                }
-
-                if (sliderTemplateStyle != null)
-                {
-                    slider.Style = sliderTemplateStyle;
-                    return;
-                }
-
-                var trackColor = BlendColor(Color.FromRgb(40, 54, 78), _activeGlassAccent, 0.26);
-                slider.Foreground = new SolidColorBrush(_activeGlassAccent);
-                slider.Background = new SolidColorBrush(Color.FromArgb(156, trackColor.R, trackColor.G, trackColor.B));
-                slider.Height = 20;
-            }
-
-            void ApplyCheckTheme(CheckBox checkBox)
-            {
-                checkBox.Foreground = new SolidColorBrush(Color.FromRgb(242, 248, 255));
-                checkBox.Opacity = 1.0;
-                checkBox.IsEnabledChanged += (_, _) =>
-                {
-                    checkBox.Opacity = 1.0;
-                };
-            }
-
-            void ApplyComboTheme(ComboBox combo)
-            {
-                string Hex(Color c) => $"{c.R:X2}{c.G:X2}{c.B:X2}";
-                var inputBgBase = BlendColor(Color.FromRgb(19, 30, 48), _activeGlassAccent, 0.20);
-                var inputBg = new SolidColorBrush(Color.FromArgb(148, inputBgBase.R, inputBgBase.G, inputBgBase.B));
-                var inputBorder = new SolidColorBrush(Color.FromArgb(192, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B));
-                var inputText = new SolidColorBrush(Color.FromRgb(242, 248, 255));
-                var disabledBg = new SolidColorBrush(Color.FromArgb(124, inputBgBase.R, inputBgBase.G, inputBgBase.B));
-                var disabledBorder = new SolidColorBrush(Color.FromArgb(136, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B));
-                var disabledText = new SolidColorBrush(Color.FromRgb(198, 214, 232));
-                var popupBase = BlendColor(Color.FromRgb(11, 18, 30), _activeGlassAccent, 0.11);
-                var popupBg = new SolidColorBrush(Color.FromArgb(244, popupBase.R, popupBase.G, popupBase.B));
-                var itemBase = BlendColor(Color.FromRgb(14, 24, 39), _activeGlassAccent, 0.10);
-                var itemHoverBase = BlendColor(_activeGlassAccent, Colors.White, 0.14);
-                var itemSelectedBase = BlendColor(_activeGlassAccent, Colors.White, 0.08);
-
-                if (comboTemplateStyle == null || comboItemTemplateStyle == null)
-                {
-                    var xaml = $@"
-<ResourceDictionary
-    xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
-    xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml'>
-    <Style x:Key='GlassComboBoxStyle' TargetType='ComboBox'>
-        <Setter Property='Foreground' Value='#FFF2F8FF'/>
-        <Setter Property='Background' Value='#94{Hex(inputBgBase)}'/>
-        <Setter Property='BorderBrush' Value='#C0{Hex(_activeGlassAccent)}'/>
-        <Setter Property='BorderThickness' Value='1'/>
-        <Setter Property='Padding' Value='10,0,30,0'/>
-        <Setter Property='MinHeight' Value='28'/>
-        <Setter Property='HorizontalContentAlignment' Value='Left'/>
-        <Setter Property='VerticalContentAlignment' Value='Center'/>
-        <Setter Property='Template'>
-            <Setter.Value>
-                <ControlTemplate TargetType='ComboBox'>
-                    <Grid SnapsToDevicePixels='True'>
-                        <Border x:Name='RootBorder'
-                                Background='{{TemplateBinding Background}}'
-                                BorderBrush='{{TemplateBinding BorderBrush}}'
-                                BorderThickness='{{TemplateBinding BorderThickness}}'
-                                CornerRadius='4'/>
-                        <Grid>
-                            <ContentPresenter x:Name='ContentSite'
-                                              Margin='{{TemplateBinding Padding}}'
-                                              HorizontalAlignment='{{TemplateBinding HorizontalContentAlignment}}'
-                                              VerticalAlignment='{{TemplateBinding VerticalContentAlignment}}'
-                                              Content='{{TemplateBinding SelectionBoxItem}}'
-                                              ContentTemplate='{{TemplateBinding SelectionBoxItemTemplate}}'
-                                              IsHitTestVisible='False'/>
-                            <Path x:Name='Arrow'
-                                  HorizontalAlignment='Right'
-                                  Margin='0,0,10,0'
-                                  VerticalAlignment='Center'
-                                  Fill='{{TemplateBinding Foreground}}'
-                                  Data='M 0 0 L 8 0 L 4 6 Z'/>
-                            <ToggleButton x:Name='DropDownToggle'
-                                          Focusable='False'
-                                          Background='Transparent'
-                                          BorderThickness='0'
-                                          IsChecked='{{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={{RelativeSource TemplatedParent}}}}'
-                                          ClickMode='Press'>
-                                <ToggleButton.Template>
-                                    <ControlTemplate TargetType='ToggleButton'>
-                                        <Border Background='Transparent'/>
-                                    </ControlTemplate>
-                                </ToggleButton.Template>
-                            </ToggleButton>
-                        </Grid>
-                        <Popup x:Name='PART_Popup'
-                               Placement='Bottom'
-                               IsOpen='{{TemplateBinding IsDropDownOpen}}'
-                               AllowsTransparency='True'
-                               Focusable='False'
-                               PopupAnimation='Fade'>
-                            <Border x:Name='PopupBorder'
-                                    MinWidth='{{Binding ActualWidth, RelativeSource={{RelativeSource TemplatedParent}}}}'
-                                    Margin='0,4,0,0'
-                                    Background='#F2{Hex(popupBase)}'
-                                    BorderBrush='{{TemplateBinding BorderBrush}}'
-                                    BorderThickness='1'
-                                    CornerRadius='6'>
-                                <ScrollViewer CanContentScroll='True' MaxHeight='320' Background='Transparent' Padding='1'>
-                                    <ItemsPresenter Margin='0'/>
-                                </ScrollViewer>
-                            </Border>
-                        </Popup>
-                    </Grid>
-                    <ControlTemplate.Triggers>
-                        <Trigger Property='HasItems' Value='False'>
-                            <Setter TargetName='PopupBorder' Property='MinHeight' Value='28'/>
-                        </Trigger>
-                        <Trigger Property='IsDropDownOpen' Value='True'>
-                            <Setter TargetName='RootBorder' Property='BorderBrush' Value='#FF{Hex(_activeGlassAccent)}'/>
-                        </Trigger>
-                        <Trigger Property='IsMouseOver' Value='True'>
-                            <Setter TargetName='RootBorder' Property='BorderBrush' Value='#EC{Hex(_activeGlassAccent)}'/>
-                        </Trigger>
-                        <Trigger Property='IsEnabled' Value='False'>
-                            <Setter TargetName='RootBorder' Property='Background' Value='#7C{Hex(inputBgBase)}'/>
-                            <Setter TargetName='RootBorder' Property='BorderBrush' Value='#88{Hex(_activeGlassAccent)}'/>
-                            <Setter Property='Foreground' Value='#FFC6D6E8'/>
-                            <Setter TargetName='Arrow' Property='Opacity' Value='0.72'/>
-                        </Trigger>
-                    </ControlTemplate.Triggers>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-    <Style x:Key='GlassComboBoxItemStyle' TargetType='ComboBoxItem'>
-        <Setter Property='Foreground' Value='#FFF2F8FF'/>
-        <Setter Property='Background' Value='#CE{Hex(itemBase)}'/>
-        <Setter Property='Padding' Value='10,4,10,4'/>
-        <Setter Property='BorderThickness' Value='1'/>
-        <Setter Property='BorderBrush' Value='Transparent'/>
-        <Setter Property='HorizontalContentAlignment' Value='Left'/>
-        <Setter Property='Template'>
-            <Setter.Value>
-                <ControlTemplate TargetType='ComboBoxItem'>
-                    <Border x:Name='ItemBorder'
-                            Margin='2,1,2,1'
-                            CornerRadius='4'
-                            Background='{{TemplateBinding Background}}'
-                            BorderBrush='{{TemplateBinding BorderBrush}}'
-                            BorderThickness='{{TemplateBinding BorderThickness}}'>
-                        <ContentPresenter Margin='{{TemplateBinding Padding}}'
-                                          VerticalAlignment='Center'
-                                          HorizontalAlignment='{{TemplateBinding HorizontalContentAlignment}}'/>
-                    </Border>
-                    <ControlTemplate.Triggers>
-                        <Trigger Property='IsHighlighted' Value='True'>
-                            <Setter TargetName='ItemBorder' Property='Background' Value='#B8{Hex(itemHoverBase)}'/>
-                            <Setter TargetName='ItemBorder' Property='BorderBrush' Value='#D8{Hex(_activeGlassAccent)}'/>
-                            <Setter Property='Foreground' Value='#FFF2F8FF'/>
-                        </Trigger>
-                        <Trigger Property='IsSelected' Value='True'>
-                            <Setter TargetName='ItemBorder' Property='Background' Value='#D0{Hex(itemSelectedBase)}'/>
-                            <Setter TargetName='ItemBorder' Property='BorderBrush' Value='#FF{Hex(_activeGlassAccent)}'/>
-                            <Setter Property='Foreground' Value='#FFF2F8FF'/>
-                        </Trigger>
-                        <Trigger Property='IsEnabled' Value='False'>
-                            <Setter Property='Foreground' Value='#FFC6D6E8'/>
-                            <Setter TargetName='ItemBorder' Property='Opacity' Value='0.72'/>
-                        </Trigger>
-                    </ControlTemplate.Triggers>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
-</ResourceDictionary>";
-
-                    try
-                    {
-                        var dict = (ResourceDictionary)System.Windows.Markup.XamlReader.Parse(xaml);
-                        comboTemplateStyle = dict["GlassComboBoxStyle"] as Style;
-                        comboItemTemplateStyle = dict["GlassComboBoxItemStyle"] as Style;
-                    }
-                    catch
-                    {
-                        comboTemplateStyle = null;
-                        comboItemTemplateStyle = null;
-                    }
-                }
-
-                combo.IsEditable = false;
-                combo.Foreground = inputText;
-                combo.Background = inputBg;
-                combo.BorderBrush = inputBorder;
-                combo.BorderThickness = new Thickness(1);
-                combo.Padding = new Thickness(8, 3, 8, 3);
-                combo.Opacity = 1.0;
-                combo.HorizontalAlignment = HorizontalAlignment.Stretch;
-                combo.MinWidth = 0;
-                if (comboTemplateStyle != null)
-                {
-                    combo.Style = comboTemplateStyle;
-                }
-                else
-                {
-                    var comboStyle = new Style(typeof(ComboBox));
-                    comboStyle.Setters.Add(new Setter(Control.ForegroundProperty, inputText));
-                    comboStyle.Setters.Add(new Setter(Control.BackgroundProperty, inputBg));
-                    comboStyle.Setters.Add(new Setter(Control.BorderBrushProperty, inputBorder));
-                    comboStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
-                    comboStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(8, 3, 8, 3)));
-                    comboStyle.Setters.Add(new Setter(UIElement.OpacityProperty, 1.0));
-
-                    var comboDisabled = new Trigger
-                    {
-                        Property = UIElement.IsEnabledProperty,
-                        Value = false
-                    };
-                    comboDisabled.Setters.Add(new Setter(Control.ForegroundProperty, disabledText));
-                    comboDisabled.Setters.Add(new Setter(Control.BackgroundProperty, disabledBg));
-                    comboDisabled.Setters.Add(new Setter(Control.BorderBrushProperty, disabledBorder));
-                    comboDisabled.Setters.Add(new Setter(UIElement.OpacityProperty, 1.0));
-                    comboStyle.Triggers.Add(comboDisabled);
-                    combo.Style = comboStyle;
-                }
-
-                if (comboItemTemplateStyle != null)
-                {
-                    combo.ItemContainerStyle = comboItemTemplateStyle;
-                }
-                else
-                {
-                    var fallbackItemStyle = new Style(typeof(ComboBoxItem));
-                    fallbackItemStyle.Setters.Add(new Setter(Control.ForegroundProperty, inputText));
-                    fallbackItemStyle.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromArgb(206, itemBase.R, itemBase.G, itemBase.B))));
-                    fallbackItemStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(10, 4, 10, 4)));
-                    fallbackItemStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
-                    fallbackItemStyle.Setters.Add(new Setter(Control.BorderBrushProperty, Brushes.Transparent));
-                    combo.ItemContainerStyle = fallbackItemStyle;
-                }
-
-                combo.Resources[SystemColors.WindowBrushKey] = popupBg;
-                combo.Resources[SystemColors.WindowTextBrushKey] = inputText;
-                combo.Resources[SystemColors.ControlBrushKey] = inputBg;
-                combo.Resources[SystemColors.ControlLightBrushKey] = inputBg;
-                combo.Resources[SystemColors.ControlLightLightBrushKey] = inputBg;
-                combo.Resources[SystemColors.WindowFrameBrushKey] = inputBorder;
-                combo.Resources[SystemColors.ControlTextBrushKey] = inputText;
-                combo.Resources[SystemColors.MenuBrushKey] = popupBg;
-                combo.Resources[SystemColors.MenuTextBrushKey] = inputText;
-                combo.Resources[SystemColors.GrayTextBrushKey] = disabledText;
-                combo.Resources[SystemColors.InactiveSelectionHighlightBrushKey] = new SolidColorBrush(Color.FromArgb(156, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B));
-                combo.Resources[SystemColors.InactiveSelectionHighlightTextBrushKey] = Brushes.Black;
-                combo.Resources[SystemColors.HighlightBrushKey] = new SolidColorBrush(_activeGlassAccent);
-                combo.Resources[SystemColors.HighlightTextBrushKey] = Brushes.Black;
-            }
-
-            void ApplyTextBoxTheme(TextBox box)
-            {
-                var inputBgBase = BlendColor(Color.FromRgb(19, 30, 48), _activeGlassAccent, 0.20);
-                box.Foreground = new SolidColorBrush(Color.FromRgb(242, 248, 255));
-                box.Background = new SolidColorBrush(Color.FromArgb(148, inputBgBase.R, inputBgBase.G, inputBgBase.B));
-                box.BorderBrush = new SolidColorBrush(Color.FromArgb(192, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B));
-                box.BorderThickness = new Thickness(1);
-                box.Padding = new Thickness(8, 4, 8, 4);
-                box.CaretBrush = new SolidColorBrush(Color.FromRgb(242, 248, 255));
-            }
-
-            void ApplyActionButtonTheme(Button button)
-            {
-                var baseColor = BlendColor(Color.FromRgb(14, 28, 46), _activeGlassAccent, 0.24);
-                var hoverColor = BlendColor(baseColor, _activeGlassAccent, 0.42);
-                var pressColor = BlendColor(baseColor, _activeGlassAccent, 0.56);
-                var borderColor = BlendColor(Color.FromRgb(120, 176, 214), _activeGlassAccent, 0.46);
-                var disabledColor = BlendColor(Color.FromRgb(72, 88, 106), _activeGlassAccent, 0.22);
-                var disabledBorder = BlendColor(Color.FromRgb(104, 128, 150), _activeGlassAccent, 0.20);
-
-                if (actionButtonStyle == null)
-                {
-                    var style = new Style(typeof(Button));
-                    style.Setters.Add(new Setter(Control.ForegroundProperty, new SolidColorBrush(Color.FromRgb(242, 248, 255))));
-                    style.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromArgb(162, baseColor.R, baseColor.G, baseColor.B))));
-                    style.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(206, borderColor.R, borderColor.G, borderColor.B))));
-                    style.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(1)));
-                    style.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(10, 0, 10, 0)));
-                    style.Setters.Add(new Setter(UIElement.OpacityProperty, 1.0));
-
-                    var hover = new Trigger { Property = UIElement.IsMouseOverProperty, Value = true };
-                    hover.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromArgb(198, hoverColor.R, hoverColor.G, hoverColor.B))));
-                    hover.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(236, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B))));
-                    style.Triggers.Add(hover);
-
-                    var pressed = new Trigger { Property = ButtonBase.IsPressedProperty, Value = true };
-                    pressed.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromArgb(214, pressColor.R, pressColor.G, pressColor.B))));
-                    pressed.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(248, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B))));
-                    style.Triggers.Add(pressed);
-
-                    var disabled = new Trigger { Property = UIElement.IsEnabledProperty, Value = false };
-                    disabled.Setters.Add(new Setter(Control.BackgroundProperty, new SolidColorBrush(Color.FromArgb(120, disabledColor.R, disabledColor.G, disabledColor.B))));
-                    disabled.Setters.Add(new Setter(Control.BorderBrushProperty, new SolidColorBrush(Color.FromArgb(146, disabledBorder.R, disabledBorder.G, disabledBorder.B))));
-                    disabled.Setters.Add(new Setter(Control.ForegroundProperty, new SolidColorBrush(Color.FromRgb(194, 210, 226))));
-                    disabled.Setters.Add(new Setter(UIElement.OpacityProperty, 1.0));
-                    style.Triggers.Add(disabled);
-
-                    actionButtonStyle = style;
-                }
-
-                button.Style = actionButtonStyle;
-                button.Cursor = Cursors.Hand;
-            }
-
-            void AttachOptionLegend(FrameworkElement optionElement, string legendText)
-            {
-                var tip = new ToolTip
-                {
-                    Content = legendText,
-                    Placement = PlacementMode.MousePoint,
-                    Background = new SolidColorBrush(Color.FromArgb(238, 10, 18, 30)),
-                    Foreground = new SolidColorBrush(Color.FromRgb(242, 248, 255)),
-                    BorderBrush = new SolidColorBrush(Color.FromArgb(200, _activeGlassAccent.R, _activeGlassAccent.G, _activeGlassAccent.B)),
-                    BorderThickness = new Thickness(1),
-                    Padding = new Thickness(8, 6, 8, 6)
-                };
-
-                optionElement.ToolTip = tip;
-                ToolTipService.SetInitialShowDelay(optionElement, 220);
-                ToolTipService.SetBetweenShowDelay(optionElement, 80);
-                ToolTipService.SetShowDuration(optionElement, 9000);
-            }
-
-            void GuardComboInteraction(ComboBox combo)
-            {
-                combo.DropDownOpened += (_, _) =>
-                {
-                    _isUserInteracting = true;
-                    _cornerRevealVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(CornerRevealHoldMs);
-                };
-                combo.DropDownClosed += (_, _) =>
-                {
-                    _isUserInteracting = false;
-                };
-            }
-            RefreshSettingsInputStyles();
-            ApplyComboTheme(overlayModeCombo);
-            GuardComboInteraction(overlayModeCombo);
-            ApplyTextBoxTheme(gameHookTitleBox);
-            ApplyTextBoxTheme(gameHookAssetsBox);
-            ApplySliderTheme(appsSlider);
-
-            var isDesktopModeUi = IsDesktopOverlayMode();
-            chkDock.IsEnabled = true;
-            gameHookTitleBox.IsEnabled = !isDesktopModeUi;
-            gameHookAssetsBox.IsEnabled = !isDesktopModeUi;
-            btnHookCheck.IsEnabled = !isDesktopModeUi;
-            btnHookInject.IsEnabled = !isDesktopModeUi;
-            chkGameHookAutoRuntime.IsEnabled = !isDesktopModeUi;
-            chkGameHookForwardInput.IsEnabled = !isDesktopModeUi;
-            btnRuntimeStart.IsEnabled = !isDesktopModeUi;
-            btnRuntimeStop.IsEnabled = !isDesktopModeUi;
-            btnRuntimeIntercept.IsEnabled = !isDesktopModeUi;
-
-            var dockSideCombo = new ComboBox
-            {
-                Height = 28,
-                Margin = new Thickness(0, 0, 0, 4),
-                ItemsSource = new[] { DockSideLeftLabel(), DockSideRightLabel() },
-                SelectedIndex = _edgeDockSide == "left" ? 0 : 1
-            };
-            ApplyComboTheme(dockSideCombo);
-            GuardComboInteraction(dockSideCombo);
-            AttachOptionLegend(dockSideCombo, "Waehlt die bevorzugte Seite fuer das Rand-Andocken.");
-            // Dock side is derived from where the user snaps the window; no separate side selector.
-
-            var dockPeekSlider = new Slider
-            {
-                Minimum = EdgeDockVisibleMin,
-                Maximum = EdgeDockVisibleMax,
-                Value = _edgeDockVisibleWidth,
-                TickFrequency = 2,
-                IsSnapToTickEnabled = true,
-                IsEnabled = _edgeDockEnabled
-            };
-            ApplySliderTheme(dockPeekSlider);
-            AttachOptionLegend(dockPeekSlider, "Legt fest, wie viel vom Overlay im angedockten Zustand sichtbar bleibt.");
-            var dockPeekLbl = new TextBlock
-            {
-                Text = FormatDockPeekLabel(_edgeDockVisibleWidth),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            sp.Children.Add(dockPeekSlider);
-            sp.Children.Add(dockPeekLbl);
-
-            var dockRevealSlider = new Slider
-            {
-                Minimum = EdgeDockRevealZoneMin,
-                Maximum = EdgeDockRevealZoneMax,
-                Value = _edgeDockRevealZoneWidth,
-                TickFrequency = 2,
-                IsSnapToTickEnabled = true,
-                IsEnabled = _edgeDockEnabled
-            };
-            var dockRevealLbl = new TextBlock
-            {
-                Text = FormatDockRevealLabel(_edgeDockRevealZoneWidth),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            ApplySliderTheme(dockRevealSlider);
-            AttachOptionLegend(dockRevealSlider, "Breite der unsichtbaren Hover-Zone am Rand, die das Overlay einblendet.");
-            // The visible hover hint is now the user-facing activation target.
-            // Keep the legacy dock reveal value internally for existing dock behavior.
-
-            void PersistDockSettings()
-            {
-                if (_ctrl == null)
-                {
-                    return;
-                }
-
-                _ctrl.Settings.Window.IsDocked = _edgeDockEnabled;
-                _ctrl.Settings.Window.DockSide = _edgeDockSide;
-                _ctrl.Settings.Window.DockVisibleWidth = _edgeDockVisibleWidth;
-                _ctrl.Settings.Window.DockRevealZoneWidth = _edgeDockRevealZoneWidth;
-                _ctrl.Settings.Window.CornerSnapAnchor = SerializeCornerSnapAnchor(AlignCornerToDockSide(_rememberedSnapCorner, _edgeDockSide));
-            }
-
-            void SyncOverlayModeComboDisplay()
-            {
-                var targetIndex = IsDesktopOverlayMode() ? 0 : 1;
-                var items = new[] { "Desktop Overlay", "Game-Hook (Experimental)" };
-
-                isSyncingOverlayModeCombo = true;
-                overlayModeCombo.ItemsSource = null;
-                overlayModeCombo.ItemsSource = items;
-                overlayModeCombo.SelectedIndex = targetIndex;
-                overlayModeCombo.InvalidateMeasure();
-                overlayModeCombo.InvalidateVisual();
-                overlayModeCombo.UpdateLayout();
-                isSyncingOverlayModeCombo = false;
-            }
-
-            void SyncDockSideComboDisplay()
-            {
-                var targetIndex = _edgeDockSide == "left" ? 0 : 1;
-                var items = new[] { DockSideLeftLabel(), DockSideRightLabel() };
-
-                isSyncingDockSideCombo = true;
-                dockSideCombo.ItemsSource = null;
-                dockSideCombo.ItemsSource = items;
-                dockSideCombo.SelectedIndex = targetIndex;
-                dockSideCombo.InvalidateMeasure();
-                dockSideCombo.InvalidateVisual();
-                dockSideCombo.UpdateLayout();
-                isSyncingDockSideCombo = false;
-            }
-
-            chkDock.Click += (_, _) =>
-            {
-                _edgeDockEnabled = chkDock.IsChecked == true;
-                dockPeekSlider.IsEnabled = _edgeDockEnabled;
-                dockRevealSlider.IsEnabled = _edgeDockEnabled;
-
-                SetEdgeDockEnabled(_edgeDockEnabled);
-                PersistDockSettings();
-                QueuePersistCurrentState();
-            };
-
-            dockSideCombo.SelectionChanged += (_, _) =>
-            {
-                if (isSyncingDockSideCombo)
-                {
-                    return;
-                }
-
-                _edgeDockSide = dockSideCombo.SelectedIndex <= 0 ? "left" : "right";
-                RememberSnapCorner(_rememberedSnapCorner, syncDockSide: false, persist: false);
-                if (_edgeDockEnabled && _edgeDockActive)
-                {
-                    var expandForEdit = _settingsWin != null || _isUserInteracting || _edgeDockExpanded;
-                    ApplyEdgeDockPlacement(expand: expandForEdit, force: true);
-                }
-                PersistDockSettings();
-                SyncDockSideComboDisplay();
-                UpdateCornerHintWindow();
-                PersistCurrentState();
-            };
-
-            dockPeekSlider.ValueChanged += (_, _) =>
-            {
-                _edgeDockVisibleWidth = (int)dockPeekSlider.Value;
-                dockPeekLbl.Text = FormatDockPeekLabel(_edgeDockVisibleWidth);
-                if (_edgeDockEnabled && _edgeDockActive)
-                {
-                    var expandForEdit = _settingsWin != null || _isUserInteracting || _edgeDockExpanded;
-                    ApplyEdgeDockPlacement(expand: expandForEdit, force: true);
-                }
-                PersistDockSettings();
-            };
-
-            dockRevealSlider.ValueChanged += (_, _) =>
-            {
-                _edgeDockRevealZoneWidth = (int)dockRevealSlider.Value;
-                dockRevealLbl.Text = FormatDockRevealLabel(_edgeDockRevealZoneWidth);
-                PersistDockSettings();
-            };
-
-            var chkCornerDot = new CheckBox
-            {
-                Content = Ui("Ecken-Anzeige zeigen", "Show corner hint"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _cornerHintShowDot
-            };
-            ApplyCheckTheme(chkCornerDot);
-            AttachOptionLegend(chkCornerDot, "Zeigt den kleinen Ecken-Hinweis fuer die Hover-Zone. Die Hover-Funktion selbst bleibt unabhaengig davon aktiv.");
-            chkCornerDot.Click += (_, _) =>
-            {
-                _cornerHintShowDot = chkCornerDot.IsChecked == true;
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerHintShowDot = _cornerHintShowDot;
-                }
-
-                UpdateCornerHintWindow();
-                QueuePersistCurrentState();
-            };
-            // The hint dot is always visible while corner reveal is enabled, so it matches the hover target.
-
-            var chkCornerValue = new CheckBox
-            {
-                Content = Ui("Lautstaerke in Ecken-Anzeige", "Show volume in corner hint"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _cornerHintShowValue
-            };
-            ApplyCheckTheme(chkCornerValue);
-            AttachOptionLegend(chkCornerValue, "Zeigt die Lautstaerke der zuletzt aktiven Audio-App in der Ecken-Anzeige.");
-            ComboBox? cornerValueColorCombo = null;
-            var chkCornerValueCustomColor = new CheckBox
-            {
-                Content = Ui("Eigene Zahlenfarbe", "Custom value color"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _cornerHintUseCustomValueColor
-            };
-            ApplyCheckTheme(chkCornerValueCustomColor);
-            AttachOptionLegend(chkCornerValueCustomColor, "Nutze eine eigene Farbe fuer die Lautstaerke-Zahl in der Ecken-Anzeige.");
-
-            var cornerValueCustomColorRow = new Grid { Margin = new Thickness(0, 0, 0, 4) };
-            cornerValueCustomColorRow.ColumnDefinitions.Add(new ColumnDefinition());
-            cornerValueCustomColorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var cornerValueCustomHexBox = new TextBox
-            {
-                Height = 28,
-                MinWidth = 120,
-                Text = NormalizeHexColor(_cornerHintCustomValueColorHex, ResolveCornerHintValueColor())
-            };
-            ApplyTextBoxTheme(cornerValueCustomHexBox);
-            AttachOptionLegend(cornerValueCustomHexBox, "Hex fuer Hook-Zahl, z.B. #74F2FF.");
-            cornerValueCustomColorRow.Children.Add(cornerValueCustomHexBox);
-
-            var cornerValueCustomPreview = new Border
-            {
-                Width = 28,
-                Height = 20,
-                CornerRadius = new CornerRadius(4),
-                BorderThickness = new Thickness(1),
-                Margin = new Thickness(8, 4, 0, 0),
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Top
-            };
-            Grid.SetColumn(cornerValueCustomPreview, 1);
-            cornerValueCustomColorRow.Children.Add(cornerValueCustomPreview);
-
-            var cornerValueCustomRgbLbl = new TextBlock
-            {
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            };
-
-            var cornerValueCustomRedSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(cornerValueCustomRedSlider);
-            AttachOptionLegend(cornerValueCustomRedSlider, "Rot-Anteil fuer die Hook-Zahl.");
-
-            var cornerValueCustomGreenSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(cornerValueCustomGreenSlider);
-            AttachOptionLegend(cornerValueCustomGreenSlider, "Gruen-Anteil fuer die Hook-Zahl.");
-
-            var cornerValueCustomBlueSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            ApplySliderTheme(cornerValueCustomBlueSlider);
-            AttachOptionLegend(cornerValueCustomBlueSlider, "Blau-Anteil fuer die Hook-Zahl.");
-
-            var isSyncingCornerValueCustomInputs = false;
-            Color CurrentCornerValueCustomColor()
-            {
-                if (TryParseHexColor(_cornerHintCustomValueColorHex, out var parsed))
-                {
-                    return parsed;
-                }
-
-                return ResolveCornerHintValueColor();
-            }
-
-            void SyncCornerValueCustomInputs()
-            {
-                var color = CurrentCornerValueCustomColor();
-                isSyncingCornerValueCustomInputs = true;
-                cornerValueCustomHexBox.Text = ColorToHex(color);
-                cornerValueCustomRedSlider.Value = color.R;
-                cornerValueCustomGreenSlider.Value = color.G;
-                cornerValueCustomBlueSlider.Value = color.B;
-                isSyncingCornerValueCustomInputs = false;
-
-                var rim = BlendColor(color, Colors.White, 0.45);
-                cornerValueCustomPreview.Background = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B));
-                cornerValueCustomPreview.BorderBrush = new SolidColorBrush(Color.FromArgb(220, rim.R, rim.G, rim.B));
-                cornerValueCustomRgbLbl.Text = $"RGB: {color.R} / {color.G} / {color.B}";
-            }
-
-            void SyncCornerValueColorControlState()
-            {
-                var valueEnabled = _cornerHintShowValue;
-                var customEnabled = valueEnabled && _cornerHintUseCustomValueColor;
-                if (cornerValueColorCombo != null)
-                {
-                    cornerValueColorCombo.IsEnabled = valueEnabled && !_cornerHintUseCustomValueColor;
-                    cornerValueColorCombo.Visibility = valueEnabled && !_cornerHintUseCustomValueColor
-                        ? Visibility.Visible
-                        : Visibility.Collapsed;
-                }
-                chkCornerValueCustomColor.IsEnabled = valueEnabled;
-                chkCornerValueCustomColor.Visibility = valueEnabled ? Visibility.Visible : Visibility.Collapsed;
-                cornerValueCustomColorRow.Visibility = customEnabled ? Visibility.Visible : Visibility.Collapsed;
-                cornerValueCustomRgbLbl.Visibility = customEnabled ? Visibility.Visible : Visibility.Collapsed;
-                cornerValueCustomRedSlider.Visibility = customEnabled ? Visibility.Visible : Visibility.Collapsed;
-                cornerValueCustomGreenSlider.Visibility = customEnabled ? Visibility.Visible : Visibility.Collapsed;
-                cornerValueCustomBlueSlider.Visibility = customEnabled ? Visibility.Visible : Visibility.Collapsed;
-                cornerValueCustomHexBox.IsEnabled = customEnabled;
-                cornerValueCustomRedSlider.IsEnabled = customEnabled;
-                cornerValueCustomGreenSlider.IsEnabled = customEnabled;
-                cornerValueCustomBlueSlider.IsEnabled = customEnabled;
-            }
-
-            chkCornerValue.Click += (_, _) =>
-            {
-                _cornerHintShowValue = chkCornerValue.IsChecked == true;
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerHintShowValue = _cornerHintShowValue;
-                }
-
-                SyncCornerValueColorControlState();
-                ApplyCornerHintTheme();
-                UpdateCornerHintWindow();
-                QueuePersistCurrentState();
-            };
-            sp.Children.Add(chkCornerValue);
-
-            cornerValueColorCombo = new ComboBox
-            {
-                Height = 28,
-                Margin = new Thickness(0, 0, 0, 6),
-                ItemsSource = new[] { "Auto", "White", "Cyan", "Emerald", "Amber", "Rose" },
-                SelectedItem = NormalizeCornerHintValueColor(_cornerHintValueColor),
-                IsEnabled = _cornerHintShowValue
-            };
-            ApplyComboTheme(cornerValueColorCombo);
-            GuardComboInteraction(cornerValueColorCombo);
-            AttachOptionLegend(cornerValueColorCombo, "Farbe der Lautstaerke-Zahl in der Ecken-Anzeige.");
-            cornerValueColorCombo.SelectionChanged += (_, _) =>
-            {
-                if (cornerValueColorCombo.SelectedItem is not string selected)
-                {
-                    return;
-                }
-
-                _cornerHintValueColor = NormalizeCornerHintValueColor(selected);
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerHintValueColor = _cornerHintValueColor;
-                }
-
-                ApplyCornerHintTheme();
-                UpdateCornerHintWindow();
-                QueuePersistCurrentState();
-            };
-
-            chkCornerValueCustomColor.Click += (_, _) =>
-            {
-                var currentColor = ResolveCornerHintValueColor();
-                _cornerHintUseCustomValueColor = chkCornerValueCustomColor.IsChecked == true;
-                if (_cornerHintUseCustomValueColor)
-                {
-                    _cornerHintCustomValueColorHex = ColorToHex(currentColor);
-                }
-
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerHintUseCustomValueColor = _cornerHintUseCustomValueColor;
-                    _ctrl.Settings.Ui.CornerHintCustomValueColorHex = NormalizeHexColor(_cornerHintCustomValueColorHex, currentColor);
-                }
-
-                SyncCornerValueCustomInputs();
-                SyncCornerValueColorControlState();
-                ApplyCornerHintTheme();
-                UpdateCornerHintWindow();
-                QueuePersistCurrentState();
-            };
-
-            void ApplyCornerValueCustomHexFromText()
-            {
-                if (isSyncingCornerValueCustomInputs)
-                {
-                    return;
-                }
-
-                if (!TryParseHexColor(cornerValueCustomHexBox.Text, out var parsed))
-                {
-                    SyncCornerValueCustomInputs();
-                    return;
-                }
-
-                _cornerHintCustomValueColorHex = ColorToHex(parsed);
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerHintCustomValueColorHex = _cornerHintCustomValueColorHex;
-                }
-
-                if (_cornerHintUseCustomValueColor && _cornerHintShowValue)
-                {
-                    ApplyCornerHintTheme();
-                    UpdateCornerHintWindow();
-                }
-                SyncCornerValueCustomInputs();
-                QueuePersistCurrentState();
-            }
-
-            cornerValueCustomHexBox.LostFocus += (_, _) => ApplyCornerValueCustomHexFromText();
-            cornerValueCustomHexBox.KeyDown += (_, e) =>
-            {
-                if (e.Key != Key.Enter)
-                {
-                    return;
-                }
-
-                ApplyCornerValueCustomHexFromText();
-                e.Handled = true;
-            };
-
-            void UpdateCornerValueCustomColorFromSliders()
-            {
-                if (isSyncingCornerValueCustomInputs)
-                {
-                    return;
-                }
-
-                var color = Color.FromRgb(
-                    (byte)Math.Clamp(Math.Round(cornerValueCustomRedSlider.Value), 0, 255),
-                    (byte)Math.Clamp(Math.Round(cornerValueCustomGreenSlider.Value), 0, 255),
-                    (byte)Math.Clamp(Math.Round(cornerValueCustomBlueSlider.Value), 0, 255));
-
-                _cornerHintCustomValueColorHex = ColorToHex(color);
-                cornerValueCustomHexBox.Text = _cornerHintCustomValueColorHex;
-                cornerValueCustomRgbLbl.Text = $"RGB: {color.R} / {color.G} / {color.B}";
-                cornerValueCustomPreview.Background = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B));
-                var rim = BlendColor(color, Colors.White, 0.45);
-                cornerValueCustomPreview.BorderBrush = new SolidColorBrush(Color.FromArgb(220, rim.R, rim.G, rim.B));
-
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerHintCustomValueColorHex = _cornerHintCustomValueColorHex;
-                }
-
-                if (_cornerHintUseCustomValueColor && _cornerHintShowValue)
-                {
-                    ApplyCornerHintTheme();
-                    UpdateCornerHintWindow();
-                }
-
-                QueuePersistCurrentState();
-            }
-
-            cornerValueCustomRedSlider.ValueChanged += (_, _) => UpdateCornerValueCustomColorFromSliders();
-            cornerValueCustomGreenSlider.ValueChanged += (_, _) => UpdateCornerValueCustomColorFromSliders();
-            cornerValueCustomBlueSlider.ValueChanged += (_, _) => UpdateCornerValueCustomColorFromSliders();
-            SyncCornerValueCustomInputs();
-            SyncCornerValueColorControlState();
-
-            var chkCornerReveal = new CheckBox
-            {
-                Content = Ui("Ecken-Reveal (fur alle Apps)", "Corner reveal (for all apps)"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 6),
-                IsChecked = _cornerRevealEnabled,
-                IsEnabled = true
-            };
-            ApplyCheckTheme(chkCornerReveal);
-            AttachOptionLegend(chkCornerReveal, "Blendet das Overlay per Hover in der naechsten Bildschirmecke ein.");
-            chkCornerReveal.Click += (_, _) =>
-            {
-                _cornerRevealEnabled = chkCornerReveal.IsChecked == true;
-                _cornerRevealVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(CornerRevealHoldMs);
-
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.CornerRevealEnabled = _cornerRevealEnabled;
-                }
-
-                ApplyCornerRevealVisualState(true);
-                UpdateCornerHintWindow();
-                QueuePersistCurrentState();
-            };
-            sp.Children.Add(chkCornerReveal);
-
-            void PersistOverlayModeSettings()
-            {
-                if (_ctrl == null)
-                {
-                    return;
-                }
-
-                _ctrl.Settings.GameHook ??= new MiniMixerOverlay.Core.Interfaces.GameHookSettings();
-                _ctrl.Settings.Ui.OverlayMode = _overlayMode;
-                _ctrl.Settings.GameHook.AssetsPath = _gameHookAssetsPath;
-                _ctrl.Settings.GameHook.TargetWindowTitle = _gameHookTargetWindowTitle;
-                _ctrl.Settings.GameHook.ForwardInputToOverlay = _gameHookForwardInput;
-                _ctrl.Settings.GameHook.AutoStartRuntime = _gameHookAutoStartRuntime;
-            }
-
-            void SyncGameHookRuntimeUi()
-            {
-                var desktopMode = IsDesktopOverlayMode();
-                var runtimeRunning = _gameHookRuntime?.IsRunning == true;
-
-                chkGameHookAutoRuntime.IsEnabled = !desktopMode;
-                chkGameHookForwardInput.IsEnabled = !desktopMode;
-                btnRuntimeStart.IsEnabled = !desktopMode && !runtimeRunning;
-                btnRuntimeStop.IsEnabled = !desktopMode && runtimeRunning;
-                btnRuntimeIntercept.IsEnabled = !desktopMode && runtimeRunning;
-                btnRuntimeIntercept.Content = _gameHookInputInterceptEnabled
-                    ? Ui("Input-Abfang: AN", "Input intercept: ON")
-                    : Ui("Input-Abfang: AUS", "Input intercept: OFF");
-            }
-
-            void SyncOverlayModeUi()
-            {
-                var desktopMode = IsDesktopOverlayMode();
-                var showGameHookControls = !desktopMode;
-                SyncOverlayModeComboDisplay();
-                SyncDockSideComboDisplay();
-
-                overlayModeHintLbl.Text = desktopMode
-                    ? Ui("Desktop-Modus: Docking, Hover-Reveal und Glasfenster aktiv.", "Desktop mode: docking, hover reveal and glass window active.")
-                    : Ui("Game-Hook-Modus: Desktop-Docking pausiert, Injection-Werkzeuge aktiv.", "Game-hook mode: desktop docking paused, injection tools active.");
-
-                foreach (var control in gameHookControls)
-                {
-                    control.Visibility = showGameHookControls ? Visibility.Visible : Visibility.Collapsed;
-                }
-
-                foreach (var control in gameHookAdvancedControls)
-                {
-                    control.Visibility = Visibility.Collapsed;
-                }
-
-                chkTop.IsEnabled = desktopMode;
-                chkDock.IsEnabled = true;
-                dockPeekSlider.IsEnabled = _edgeDockEnabled;
-                dockRevealSlider.IsEnabled = _edgeDockEnabled;
-                chkCornerReveal.IsEnabled = true;
-
-                gameHookTitleBox.IsEnabled = !desktopMode;
-                gameHookAssetsBox.IsEnabled = !desktopMode;
-                btnHookCheck.IsEnabled = !desktopMode;
-                btnHookInject.IsEnabled = !desktopMode;
-                SyncGameHookRuntimeUi();
-            }
-
-            overlayModeCombo.SelectionChanged += (_, _) =>
-            {
-                if (isSyncingOverlayModeCombo)
-                {
-                    return;
-                }
-
-                try
-                {
-                    _overlayMode = overlayModeCombo.SelectedIndex == 1
-                        ? OverlayModeGameHook
-                        : OverlayModeDesktop;
-
-                    PersistOverlayModeSettings();
-                    SyncOverlayModeComboDisplay();
-                    SetEdgeDockEnabled(_edgeDockEnabled);
-                    ApplyOverlayModeRuntimeState();
-                    SyncOverlayModeUi();
-                    UpdateCornerHintWindow();
-                    PersistCurrentState();
-                    Refresh();
-                }
-                catch (Exception ex)
-                {
-                    gameHookStatusLbl.Foreground = new SolidColorBrush(Color.FromRgb(255, 130, 130));
-                    gameHookStatusLbl.Text = Ui("Moduswechsel fehlgeschlagen: ", "Mode switch failed: ") + ex.Message;
-                }
-            };
-
-            gameHookTitleBox.TextChanged += (_, _) =>
-            {
-                _gameHookTargetWindowTitle = gameHookTitleBox.Text.Trim();
-                PersistOverlayModeSettings();
-            };
-
-            gameHookAssetsBox.TextChanged += (_, _) =>
-            {
-                _gameHookAssetsPath = gameHookAssetsBox.Text.Trim();
-                PersistOverlayModeSettings();
-            };
-
-            chkGameHookAutoRuntime.Click += (_, _) =>
-            {
-                _gameHookAutoStartRuntime = chkGameHookAutoRuntime.IsChecked == true;
-                PersistOverlayModeSettings();
-                SyncGameHookRuntimeState();
-                SyncGameHookRuntimeUi();
-            };
-
-            chkGameHookForwardInput.Click += (_, _) =>
-            {
-                _gameHookForwardInput = chkGameHookForwardInput.IsChecked == true;
-                if (_gameHookRuntime != null)
-                {
-                    _gameHookRuntime.ForwardGameInputToWindow = _gameHookForwardInput;
-                }
-
-                PersistOverlayModeSettings();
-            };
-
-            btnRuntimeStart.Click += (_, _) =>
-            {
-                if (StartGameHookRuntime())
-                {
-                    gameHookStatusLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                    gameHookStatusLbl.Text = Ui("Game-Hook Runtime gestartet.", "Game-hook runtime started.");
-                }
-                else
-                {
-                    gameHookStatusLbl.Foreground = new SolidColorBrush(Color.FromRgb(255, 130, 130));
-                    gameHookStatusLbl.Text = Ui("Game-Hook Runtime konnte nicht gestartet werden.", "Game-hook runtime could not be started.");
-                }
-
-                SyncGameHookRuntimeUi();
-            };
-
-            btnRuntimeStop.Click += (_, _) =>
-            {
-                StopGameHookRuntime();
-                gameHookStatusLbl.Foreground = new SolidColorBrush(Color.FromRgb(170, 180, 210));
-                gameHookStatusLbl.Text = Ui("Game-Hook Runtime gestoppt.", "Game-hook runtime stopped.");
-                SyncGameHookRuntimeUi();
-            };
-
-            btnRuntimeIntercept.Click += (_, _) =>
-            {
-                if (_gameHookRuntime?.IsRunning != true)
-                {
-                    gameHookStatusLbl.Foreground = new SolidColorBrush(Color.FromRgb(255, 130, 130));
-                    gameHookStatusLbl.Text = Ui("Runtime ist nicht aktiv.", "Runtime is not active.");
-                    SyncGameHookRuntimeUi();
-                    return;
-                }
-
-                _gameHookInputInterceptEnabled = !_gameHookInputInterceptEnabled;
-                ApplyGameHookInputPassThrough(!_gameHookCanInteract);
-                gameHookStatusLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                gameHookStatusLbl.Text = _gameHookInputInterceptEnabled
-                    ? Ui("Input-Abfang aktiv.", "Input intercept enabled.")
-                    : Ui("Input-Abfang aus.", "Input intercept disabled.");
-                SyncGameHookRuntimeUi();
-            };
-
-            btnHookCheck.Click += (_, _) =>
-            {
-                var resolvedAssets = ResolveGameHookAssetsPath(gameHookAssetsBox.Text);
-                var helperX86 = Path.Combine(resolvedAssets, "injector_helper.exe");
-                var helperX64 = Path.Combine(resolvedAssets, "injector_helper.x64.exe");
-                var dllX86 = Path.Combine(resolvedAssets, "n_overlay.dll");
-                var dllX64 = Path.Combine(resolvedAssets, "n_overlay.x64.dll");
-
-                var ok = File.Exists(helperX86) && File.Exists(helperX64) && File.Exists(dllX86) && File.Exists(dllX64);
-                var suggestions = GameHookBridge.SuggestTopWindowTitles(gameHookTitleBox.Text, 3);
-                var suggestionText = suggestions.Count > 0
-                    ? Ui(" Fenster: ", " Windows: ") + string.Join(" | ", suggestions)
-                    : string.Empty;
-
-                gameHookStatusLbl.Foreground = ok
-                    ? new SolidColorBrush(_activeGlassAccent)
-                    : new SolidColorBrush(Color.FromRgb(255, 130, 130));
-                gameHookStatusLbl.Text = ok
-                    ? $"{Ui("Assets gefunden", "Assets found")}: {resolvedAssets}.{suggestionText}"
-                    : $"{Ui("Assets unvollstaendig", "Assets incomplete")}: {resolvedAssets}.{suggestionText}";
-            };
-
-            btnHookInject.Click += (_, _) =>
-            {
-                if (!IsDesktopOverlayMode() && _gameHookRuntime?.IsRunning != true)
-                {
-                    _ = StartGameHookRuntime();
-                }
-
-                var resolvedAssets = ResolveGameHookAssetsPath(gameHookAssetsBox.Text);
-                var result = GameHookBridge.InjectByWindowTitle(gameHookTitleBox.Text.Trim(), resolvedAssets);
-                gameHookStatusLbl.Foreground = result.Success
-                    ? new SolidColorBrush(_activeGlassAccent)
-                    : new SolidColorBrush(Color.FromRgb(255, 130, 130));
-                gameHookStatusLbl.Text = result.Message;
-                SyncGameHookRuntimeUi();
-            };
-
-            SyncOverlayModeUi();
-
-            var chkAutoAll = new CheckBox
-            {
-                Content = Ui("Auto-Limit fur alle neuen Apps", "Auto-limit for all new apps"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _autoApplyToAllNewApps
-            };
-            ApplyCheckTheme(chkAutoAll);
-            AttachOptionLegend(chkAutoAll, "Wenn aktiv, erhalten alle neuen Apps das Auto-Limit. Sonst nur neue Spiele.");
-            chkAutoAll.Click += (_, _) =>
-            {
-                _autoApplyToAllNewApps = chkAutoAll.IsChecked == true;
-                _guard?.Configure(_autoVolumePercent, _autoApplyToAllNewApps);
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.AutoApplyToAllNewApps = _autoApplyToAllNewApps;
-                }
-            };
-            sp.Children.Add(chkAutoAll);
-
-            var autoVolSlider = new Slider
-            {
-                Minimum = 1,
-                Maximum = 100,
-                Value = _autoVolumePercent,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = true
-            };
-            ApplySliderTheme(autoVolSlider);
-            AttachOptionLegend(autoVolSlider, "Einmalige Ziel-Lautstaerke fuer wirklich neue Apps. Standard: 5%. Bereits bekannte Apps werden dadurch nicht veraendert.");
-            var autoVolLbl = new TextBlock
-            {
-                Text = FormatAutoLimitLabel(_autoVolumePercent),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            autoVolSlider.ValueChanged += (_, _) =>
-            {
-                _autoVolumePercent = (int)autoVolSlider.Value;
-                autoVolLbl.Text = FormatAutoLimitLabel(_autoVolumePercent);
-                _guard?.Configure(_autoVolumePercent, _autoApplyToAllNewApps);
-                if (_ctrl != null)
-                {
-                    _ctrl.Settings.Ui.AutoVolumePercent = _autoVolumePercent;
-                }
-            };
-            sp.Children.Add(autoVolSlider);
-            sp.Children.Add(autoVolLbl);
-
-            sp.Children.Add(new TextBlock
-            {
-                Text = Ui("Glasdesign:", "Glass design:"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 2, 0, 2)
-            });
-
-            var chkWindowsAccent = new CheckBox
-            {
-                Content = Ui("Windows-Akzentfarbe nutzen", "Use Windows accent color"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _useWindowsAccentForGlass
-            };
-            ApplyCheckTheme(chkWindowsAccent);
-            AttachOptionLegend(chkWindowsAccent, "Nutze die aktuelle Windows-Akzentfarbe fuer das komplette Glasdesign.");
-            sp.Children.Add(chkWindowsAccent);
-
-            bool CanUseManualGlassPalette() => !_glassUseCustomColor && (!_useWindowsAccentForGlass || _windowsAccentUnavailable);
-
-            var paletteCombo = new ComboBox
-            {
-                Height = 28,
-                Margin = new Thickness(0, 0, 0, 4),
-                ItemsSource = _glassPalette.Keys.ToArray(),
-                SelectedItem = NormalizePaletteName(_glassPaletteName),
-                IsEnabled = CanUseManualGlassPalette()
-            };
-            ApplyComboTheme(paletteCombo);
-            GuardComboInteraction(paletteCombo);
-            AttachOptionLegend(paletteCombo, "Manuelle Akzentfarbe, wenn Windows-Akzent deaktiviert ist.");
-            sp.Children.Add(paletteCombo);
-
-            var accentFallbackLbl = new TextBlock
-            {
-                Text = Ui(
-                    "Windows-Akzentfarbe nicht gefunden - Palette wird verwendet.",
-                    "Windows accent color not found - using palette color."),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 4),
-                Visibility = Visibility.Collapsed
-            };
-            sp.Children.Add(accentFallbackLbl);
-
-            var chkCustomGlassColor = new CheckBox
-            {
-                Content = Ui("Eigene Glasfarbe (Mixer/Hex)", "Custom glass color (mixer/hex)"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _glassUseCustomColor
-            };
-            ApplyCheckTheme(chkCustomGlassColor);
-            AttachOptionLegend(chkCustomGlassColor, "Ueberschreibt Palette/Windows-Farbe mit eigener RGB- oder Hex-Farbe.");
-
-            var customGlassColorRow = new Grid { Margin = new Thickness(0, 0, 0, 4) };
-            customGlassColorRow.ColumnDefinitions.Add(new ColumnDefinition());
-            customGlassColorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var customGlassHexBox = new TextBox
-            {
-                Height = 28,
-                MinWidth = 120,
-                Text = NormalizeHexColor(_glassCustomColorHex, _glassPalette["Cyan"])
-            };
-            ApplyTextBoxTheme(customGlassHexBox);
-            AttachOptionLegend(customGlassHexBox, "Akzeptiert #RRGGBB, #RGB oder 0xRRGGBB.");
-            customGlassColorRow.Children.Add(customGlassHexBox);
-
-            var customGlassPreview = new Border
-            {
-                Width = 28,
-                Height = 20,
-                CornerRadius = new CornerRadius(4),
-                BorderThickness = new Thickness(1),
-                Margin = new Thickness(8, 4, 0, 0),
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Top
-            };
-            Grid.SetColumn(customGlassPreview, 1);
-            customGlassColorRow.Children.Add(customGlassPreview);
-
-            var customGlassRgbLbl = new TextBlock
-            {
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            };
-
-            var customGlassRedSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(customGlassRedSlider);
-            AttachOptionLegend(customGlassRedSlider, "Rot-Anteil fuer die benutzerdefinierte Glasfarbe.");
-
-            var customGlassGreenSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(customGlassGreenSlider);
-            AttachOptionLegend(customGlassGreenSlider, "Gruen-Anteil fuer die benutzerdefinierte Glasfarbe.");
-
-            var customGlassBlueSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false,
-                Margin = new Thickness(0, 0, 0, 8)
-            };
-            ApplySliderTheme(customGlassBlueSlider);
-            AttachOptionLegend(customGlassBlueSlider, "Blau-Anteil fuer die benutzerdefinierte Glasfarbe.");
-
-            var chkCustomBorderColor = new CheckBox
-            {
-                Content = Ui("Eigene Randfarbe nutzen", "Use custom border color"),
-                Foreground = Brushes.White,
-                FontSize = 13,
-                Margin = new Thickness(0, 0, 0, 4),
-                IsChecked = _glassBorderUseCustomColor
-            };
-            ApplyCheckTheme(chkCustomBorderColor);
-            AttachOptionLegend(chkCustomBorderColor, "Nutzt einen separaten Farbton nur fuer den Fensterrand.");
-
-            var customBorderColorRow = new Grid { Margin = new Thickness(0, 0, 0, 4) };
-            customBorderColorRow.ColumnDefinitions.Add(new ColumnDefinition());
-            customBorderColorRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var customBorderHexBox = new TextBox
-            {
-                Height = 28,
-                MinWidth = 120,
-                Text = NormalizeHexColor(_glassBorderColorHex, BlendColor(Color.FromRgb(188, 210, 230), _activeGlassAccent, 0.60))
-            };
-            ApplyTextBoxTheme(customBorderHexBox);
-            AttachOptionLegend(customBorderHexBox, "Rand-Farbe als Hex-Code, z.B. #6FD8FF.");
-            customBorderColorRow.Children.Add(customBorderHexBox);
-
-            var customBorderPreview = new Border
-            {
-                Width = 28,
-                Height = 20,
-                CornerRadius = new CornerRadius(4),
-                BorderThickness = new Thickness(1),
-                Margin = new Thickness(8, 4, 0, 0),
-                HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Top
-            };
-            Grid.SetColumn(customBorderPreview, 1);
-            customBorderColorRow.Children.Add(customBorderPreview);
-
-            var customBorderRgbLbl = new TextBlock
-            {
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 2)
-            };
-
-            var customBorderRedSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(customBorderRedSlider);
-            AttachOptionLegend(customBorderRedSlider, "Rot-Anteil fuer die benutzerdefinierte Randfarbe.");
-
-            var customBorderGreenSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(customBorderGreenSlider);
-            AttachOptionLegend(customBorderGreenSlider, "Gruen-Anteil fuer die benutzerdefinierte Randfarbe.");
-
-            var customBorderBlueSlider = new Slider
-            {
-                Minimum = 0,
-                Maximum = 255,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false,
-                Margin = new Thickness(0, 0, 0, 8)
-            };
-            ApplySliderTheme(customBorderBlueSlider);
-            AttachOptionLegend(customBorderBlueSlider, "Blau-Anteil fuer die benutzerdefinierte Randfarbe.");
-
-            var strengthLbl = new TextBlock
-            {
-                Text = FormatGlassStrengthLabel(_glassStrength),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11
-            };
-            var strengthSlider = new Slider
-            {
-                Minimum = 20,
-                Maximum = 100,
-                Value = _glassStrength,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false
-            };
-            ApplySliderTheme(strengthSlider);
-            AttachOptionLegend(strengthSlider, "Steuert den Farb- und Glow-Anteil des Glas-Effekts.");
-
-            var transparencyLbl = new TextBlock
-            {
-                Text = FormatGlassTransparencyLabel(_glassTransparency),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11
-            };
-            var transparencySlider = new Slider
-            {
-                Minimum = 20,
-                Maximum = 100,
-                Value = _glassTransparency,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            ApplySliderTheme(transparencySlider);
-            AttachOptionLegend(transparencySlider, "Steuert die Durchsichtigkeit der Glasflaechen.");
-            sp.Children.Add(transparencySlider);
-            sp.Children.Add(transparencyLbl);
-
-            var borderThicknessLbl = new TextBlock
-            {
-                Text = FormatGlassBorderThicknessLabel(_glassBorderThickness),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11
-            };
-            var borderThicknessSlider = new Slider
-            {
-                Minimum = GlassBorderThicknessMin,
-                Maximum = GlassBorderThicknessMax,
-                Value = _glassBorderThickness,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = true
-            };
-            ApplySliderTheme(borderThicknessSlider);
-            AttachOptionLegend(borderThicknessSlider, "Staerke des Glas-Rands.");
-
-            var borderSmudgeLbl = new TextBlock
-            {
-                Text = FormatGlassBorderSmudgeLabel(_glassBorderSmudge),
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            var borderSmudgeSlider = new Slider
-            {
-                Minimum = GlassBorderSmudgeMin,
-                Maximum = GlassBorderSmudgeMax,
-                Value = _glassBorderSmudge,
-                TickFrequency = 1,
-                IsSnapToTickEnabled = false,
-                Margin = new Thickness(0, 0, 0, 2)
-            };
-            ApplySliderTheme(borderSmudgeSlider);
-            AttachOptionLegend(borderSmudgeSlider, "Verwischt/softet den Rand wie ein weicher Pinsel.");
-
-            var isSyncingCustomGlassInputs = false;
-            var isSyncingCustomBorderInputs = false;
-
-            Color CurrentCustomGlassColor()
-            {
-                if (TryParseHexColor(_glassCustomColorHex, out var parsed))
-                {
-                    return parsed;
-                }
-
-                if (_glassPalette.TryGetValue(NormalizePaletteName(_glassPaletteName), out var paletteColor))
-                {
-                    return paletteColor;
-                }
-
-                return _glassPalette["Cyan"];
-            }
-
-            Color CurrentCustomBorderColor()
-            {
-                if (TryParseHexColor(_glassBorderColorHex, out var parsed))
-                {
-                    return parsed;
-                }
-
-                return BlendColor(Color.FromRgb(188, 210, 230), _activeGlassAccent, 0.60);
-            }
-
-            void SyncCustomGlassInputs()
-            {
-                var color = CurrentCustomGlassColor();
-                isSyncingCustomGlassInputs = true;
-                customGlassHexBox.Text = ColorToHex(color);
-                customGlassRedSlider.Value = color.R;
-                customGlassGreenSlider.Value = color.G;
-                customGlassBlueSlider.Value = color.B;
-                isSyncingCustomGlassInputs = false;
-
-                customGlassPreview.Background = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B));
-                customGlassPreview.BorderBrush = new SolidColorBrush(Color.FromArgb(220, BlendColor(color, Colors.White, 0.45).R, BlendColor(color, Colors.White, 0.45).G, BlendColor(color, Colors.White, 0.45).B));
-                customGlassRgbLbl.Text = $"RGB: {color.R} / {color.G} / {color.B}";
-                var enabled = _glassUseCustomColor;
-                customGlassColorRow.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customGlassRgbLbl.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customGlassRedSlider.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customGlassGreenSlider.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customGlassBlueSlider.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customGlassHexBox.IsEnabled = enabled;
-                customGlassRedSlider.IsEnabled = enabled;
-                customGlassGreenSlider.IsEnabled = enabled;
-                customGlassBlueSlider.IsEnabled = enabled;
-            }
-
-            void SyncCustomBorderInputs()
-            {
-                var color = CurrentCustomBorderColor();
-                isSyncingCustomBorderInputs = true;
-                customBorderHexBox.Text = ColorToHex(color);
-                customBorderRedSlider.Value = color.R;
-                customBorderGreenSlider.Value = color.G;
-                customBorderBlueSlider.Value = color.B;
-                isSyncingCustomBorderInputs = false;
-
-                customBorderPreview.Background = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B));
-                customBorderPreview.BorderBrush = new SolidColorBrush(Color.FromArgb(220, BlendColor(color, Colors.White, 0.45).R, BlendColor(color, Colors.White, 0.45).G, BlendColor(color, Colors.White, 0.45).B));
-                customBorderRgbLbl.Text = $"RGB: {color.R} / {color.G} / {color.B}";
-                var enabled = _glassBorderUseCustomColor;
-                customBorderColorRow.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customBorderRgbLbl.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customBorderRedSlider.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customBorderGreenSlider.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customBorderBlueSlider.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
-                customBorderHexBox.IsEnabled = enabled;
-                customBorderRedSlider.IsEnabled = enabled;
-                customBorderGreenSlider.IsEnabled = enabled;
-                customBorderBlueSlider.IsEnabled = enabled;
-            }
-
-            void SyncGlassLabels()
-            {
-                RefreshSettingsInputStyles();
-                strengthLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                transparencyLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                borderThicknessLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                borderSmudgeLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                customGlassRgbLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                customBorderRgbLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                cornerValueCustomRgbLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                dockPeekLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                dockRevealLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                autoVolLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                appsLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                ApplyComboTheme(overlayModeCombo);
-                ApplyComboTheme(dockSideCombo);
-                ApplyComboTheme(paletteCombo);
-                paletteCombo.IsEnabled = CanUseManualGlassPalette();
-                paletteCombo.Visibility = CanUseManualGlassPalette() ? Visibility.Visible : Visibility.Collapsed;
-                accentFallbackLbl.Foreground = new SolidColorBrush(_activeGlassAccent);
-                accentFallbackLbl.Visibility = (!_glassUseCustomColor && _useWindowsAccentForGlass && _windowsAccentUnavailable)
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
-                if (cornerValueColorCombo != null)
-                {
-                    ApplyComboTheme(cornerValueColorCombo);
-                }
-                ApplyTextBoxTheme(customGlassHexBox);
-                ApplyTextBoxTheme(customBorderHexBox);
-                ApplyTextBoxTheme(cornerValueCustomHexBox);
-                ApplyTextBoxTheme(gameHookTitleBox);
-                ApplyTextBoxTheme(gameHookAssetsBox);
-                ApplySliderTheme(appsSlider);
-                ApplySliderTheme(dockPeekSlider);
-                ApplySliderTheme(dockRevealSlider);
-                ApplySliderTheme(autoVolSlider);
-                ApplySliderTheme(customGlassRedSlider);
-                ApplySliderTheme(customGlassGreenSlider);
-                ApplySliderTheme(customGlassBlueSlider);
-                ApplySliderTheme(customBorderRedSlider);
-                ApplySliderTheme(customBorderGreenSlider);
-                ApplySliderTheme(customBorderBlueSlider);
-                ApplySliderTheme(cornerValueCustomRedSlider);
-                ApplySliderTheme(cornerValueCustomGreenSlider);
-                ApplySliderTheme(cornerValueCustomBlueSlider);
-                ApplySliderTheme(strengthSlider);
-                ApplySliderTheme(transparencySlider);
-                ApplySliderTheme(borderThicknessSlider);
-                ApplySliderTheme(borderSmudgeSlider);
-                if (widthSliderRef != null)
-                {
-                    ApplySliderTheme(widthSliderRef);
-                }
-                if (widthLblRef != null)
-                {
-                    widthLblRef.Foreground = new SolidColorBrush(_activeGlassAccent);
-                }
-                ApplyActionButtonTheme(btnLanguage);
-                ApplyActionButtonTheme(btnHookCheck);
-                ApplyActionButtonTheme(btnHookInject);
-                ApplyActionButtonTheme(btnRuntimeStart);
-                ApplyActionButtonTheme(btnRuntimeStop);
-                ApplyActionButtonTheme(btnRuntimeIntercept);
-                strengthLbl.Text = FormatGlassStrengthLabel(_glassStrength);
-                transparencyLbl.Text = FormatGlassTransparencyLabel(_glassTransparency);
-                borderThicknessLbl.Text = FormatGlassBorderThicknessLabel(_glassBorderThickness);
-                borderSmudgeLbl.Text = FormatGlassBorderSmudgeLabel(_glassBorderSmudge);
-                dockPeekLbl.Text = FormatDockPeekLabel(_edgeDockVisibleWidth);
-                dockRevealLbl.Text = FormatDockRevealLabel(_edgeDockRevealZoneWidth);
-                autoVolLbl.Text = FormatAutoLimitLabel(_autoVolumePercent);
-                SyncCustomGlassInputs();
-                SyncCustomBorderInputs();
-                SyncCornerValueCustomInputs();
-                SyncCornerValueColorControlState();
-            }
-
-            void PersistGlassSettings()
-            {
-                if (_ctrl == null)
-                {
-                    return;
-                }
-
-                _ctrl.Settings.Ui.UseWindowsAccentForGlass = _useWindowsAccentForGlass;
-                _ctrl.Settings.Ui.GlassPalette = _glassPaletteName;
-                _ctrl.Settings.Ui.GlassUseCustomColor = _glassUseCustomColor;
-                _ctrl.Settings.Ui.GlassCustomColorHex = NormalizeHexColor(_glassCustomColorHex, _glassPalette["Cyan"]);
-                _ctrl.Settings.Ui.GlassStrength = _glassStrength;
-                _ctrl.Settings.Ui.GlassTransparency = _glassTransparency;
-                _ctrl.Settings.Ui.GlassBorderUseCustomColor = _glassBorderUseCustomColor;
-                _ctrl.Settings.Ui.GlassBorderColorHex = NormalizeHexColor(_glassBorderColorHex, BlendColor(Color.FromRgb(188, 210, 230), _activeGlassAccent, 0.60));
-                _ctrl.Settings.Ui.GlassBorderThickness = (int)Math.Clamp(_glassBorderThickness, GlassBorderThicknessMin, GlassBorderThicknessMax);
-                _ctrl.Settings.Ui.GlassBorderSmudge = (int)Math.Clamp(_glassBorderSmudge, GlassBorderSmudgeMin, GlassBorderSmudgeMax);
-            }
-
-            var glassPreviewTimer = new DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(34)
-            };
-
-            void CommitGlassPreview()
-            {
-                PersistGlassSettings();
-                ApplyGlassTheme();
-            }
-
-            void QueueGlassPreview()
-            {
-                glassPreviewTimer.Stop();
-                glassPreviewTimer.Start();
-            }
-
-            glassPreviewTimer.Tick += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-            };
-
-            chkWindowsAccent.Click += (_, _) =>
-            {
-                _useWindowsAccentForGlass = chkWindowsAccent.IsChecked == true;
-                if (_useWindowsAccentForGlass)
-                {
-                    _glassUseCustomColor = false;
-                    chkCustomGlassColor.IsChecked = false;
-                }
-                NormalizeGlassColorOwnership();
-                PersistGlassSettings();
-                ApplyGlassTheme();
-                SyncGlassLabels();
-            };
-
-            chkCustomGlassColor.Click += (_, _) =>
-            {
-                _glassUseCustomColor = chkCustomGlassColor.IsChecked == true;
-                if (_glassUseCustomColor)
-                {
-                    _glassCustomColorHex = ColorToHex(_activeGlassAccent);
-                    _useWindowsAccentForGlass = false;
-                    chkWindowsAccent.IsChecked = false;
-                }
-                NormalizeGlassColorOwnership();
-
-                PersistGlassSettings();
-                ApplyGlassTheme();
-                SyncGlassLabels();
-            };
-
-            paletteCombo.SelectionChanged += (_, _) =>
-            {
-                if (paletteCombo.SelectedItem is string palette)
-                {
-                    _glassPaletteName = NormalizePaletteName(palette);
-                    PersistGlassSettings();
-                    ApplyGlassTheme();
-                    SyncGlassLabels();
-                }
-            };
-
-            void ApplyCustomGlassHexFromText()
-            {
-                if (isSyncingCustomGlassInputs)
-                {
-                    return;
-                }
-
-                if (!TryParseHexColor(customGlassHexBox.Text, out var parsed))
-                {
-                    SyncCustomGlassInputs();
-                    return;
-                }
-
-                _glassCustomColorHex = ColorToHex(parsed);
-                PersistGlassSettings();
-                ApplyGlassTheme();
-                SyncGlassLabels();
-            }
-
-            customGlassHexBox.LostFocus += (_, _) => ApplyCustomGlassHexFromText();
-            customGlassHexBox.KeyDown += (_, e) =>
-            {
-                if (e.Key != Key.Enter)
-                {
-                    return;
-                }
-
-                ApplyCustomGlassHexFromText();
-                e.Handled = true;
-            };
-
-            void UpdateCustomGlassColorFromSliders()
-            {
-                if (isSyncingCustomGlassInputs)
-                {
-                    return;
-                }
-
-                var color = Color.FromRgb(
-                    (byte)Math.Clamp(Math.Round(customGlassRedSlider.Value), 0, 255),
-                    (byte)Math.Clamp(Math.Round(customGlassGreenSlider.Value), 0, 255),
-                    (byte)Math.Clamp(Math.Round(customGlassBlueSlider.Value), 0, 255));
-
-                _glassCustomColorHex = ColorToHex(color);
-                customGlassHexBox.Text = _glassCustomColorHex;
-                customGlassRgbLbl.Text = $"RGB: {color.R} / {color.G} / {color.B}";
-                customGlassPreview.Background = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B));
-                var rim = BlendColor(color, Colors.White, 0.45);
-                customGlassPreview.BorderBrush = new SolidColorBrush(Color.FromArgb(220, rim.R, rim.G, rim.B));
-
-                if (_glassUseCustomColor)
-                {
-                    QueueGlassPreview();
-                }
-                else
-                {
-                    PersistGlassSettings();
-                }
-            }
-
-            customGlassRedSlider.ValueChanged += (_, _) => UpdateCustomGlassColorFromSliders();
-            customGlassGreenSlider.ValueChanged += (_, _) => UpdateCustomGlassColorFromSliders();
-            customGlassBlueSlider.ValueChanged += (_, _) => UpdateCustomGlassColorFromSliders();
-
-            chkCustomBorderColor.Click += (_, _) =>
-            {
-                _glassBorderUseCustomColor = chkCustomBorderColor.IsChecked == true;
-                if (_glassBorderUseCustomColor)
-                {
-                    _glassBorderColorHex = ColorToHex(ResolveGlassBorderColor(_activeGlassAccent));
-                }
-
-                PersistGlassSettings();
-                ApplyGlassTheme();
-                SyncGlassLabels();
-            };
-
-            void ApplyCustomBorderHexFromText()
-            {
-                if (isSyncingCustomBorderInputs)
-                {
-                    return;
-                }
-
-                if (!TryParseHexColor(customBorderHexBox.Text, out var parsed))
-                {
-                    SyncCustomBorderInputs();
-                    return;
-                }
-
-                _glassBorderColorHex = ColorToHex(parsed);
-                PersistGlassSettings();
-                ApplyGlassTheme();
-                SyncGlassLabels();
-            }
-
-            customBorderHexBox.LostFocus += (_, _) => ApplyCustomBorderHexFromText();
-            customBorderHexBox.KeyDown += (_, e) =>
-            {
-                if (e.Key != Key.Enter)
-                {
-                    return;
-                }
-
-                ApplyCustomBorderHexFromText();
-                e.Handled = true;
-            };
-
-            void UpdateCustomBorderColorFromSliders()
-            {
-                if (isSyncingCustomBorderInputs)
-                {
-                    return;
-                }
-
-                var color = Color.FromRgb(
-                    (byte)Math.Clamp(Math.Round(customBorderRedSlider.Value), 0, 255),
-                    (byte)Math.Clamp(Math.Round(customBorderGreenSlider.Value), 0, 255),
-                    (byte)Math.Clamp(Math.Round(customBorderBlueSlider.Value), 0, 255));
-
-                _glassBorderColorHex = ColorToHex(color);
-                customBorderHexBox.Text = _glassBorderColorHex;
-                customBorderRgbLbl.Text = $"RGB: {color.R} / {color.G} / {color.B}";
-                customBorderPreview.Background = new SolidColorBrush(Color.FromArgb(210, color.R, color.G, color.B));
-                var rim = BlendColor(color, Colors.White, 0.45);
-                customBorderPreview.BorderBrush = new SolidColorBrush(Color.FromArgb(220, rim.R, rim.G, rim.B));
-
-                if (_glassBorderUseCustomColor)
-                {
-                    QueueGlassPreview();
-                }
-                else
-                {
-                    PersistGlassSettings();
-                }
-            }
-
-            customBorderRedSlider.ValueChanged += (_, _) => UpdateCustomBorderColorFromSliders();
-            customBorderGreenSlider.ValueChanged += (_, _) => UpdateCustomBorderColorFromSliders();
-            customBorderBlueSlider.ValueChanged += (_, _) => UpdateCustomBorderColorFromSliders();
-
-            strengthSlider.ValueChanged += (_, _) =>
-            {
-                _glassStrength = (int)Math.Round(strengthSlider.Value);
-                strengthLbl.Text = FormatGlassStrengthLabel(_glassStrength);
-                QueueGlassPreview();
-            };
-
-            transparencySlider.ValueChanged += (_, _) =>
-            {
-                _glassTransparency = (int)Math.Round(transparencySlider.Value);
-                transparencyLbl.Text = FormatGlassTransparencyLabel(_glassTransparency);
-                QueueGlassPreview();
-            };
-
-            borderThicknessSlider.ValueChanged += (_, _) =>
-            {
-                _glassBorderThickness = (int)Math.Round(borderThicknessSlider.Value);
-                borderThicknessLbl.Text = FormatGlassBorderThicknessLabel(_glassBorderThickness);
-                QueueGlassPreview();
-            };
-
-            borderSmudgeSlider.ValueChanged += (_, _) =>
-            {
-                _glassBorderSmudge = (int)Math.Round(borderSmudgeSlider.Value);
-                borderSmudgeLbl.Text = FormatGlassBorderSmudgeLabel(_glassBorderSmudge);
-                QueueGlassPreview();
-            };
-
-            customGlassRedSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            customGlassGreenSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            customGlassBlueSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            customBorderRedSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            customBorderGreenSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            customBorderBlueSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            strengthSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-            };
-
-            transparencySlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-            };
-
-            borderThicknessSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            borderSmudgeSlider.LostMouseCapture += (_, _) =>
-            {
-                glassPreviewTimer.Stop();
-                CommitGlassPreview();
-                SyncGlassLabels();
-            };
-
-            SyncCustomGlassInputs();
-            SyncCustomBorderInputs();
-
-            sp.Children.Add(new TextBlock
-            {
-                Text = Ui("Fensterbreite:", "Window width:"),
-                Foreground = Brushes.LightGray,
-                FontSize = 11,
-                Margin = new Thickness(0, 6, 0, 2)
-            });
-
-            var widthSlider = new Slider
-            {
-                Minimum = 280,
-                Maximum = 500,
-                Value = _mainWin?.Width ?? 380,
-                TickFrequency = 10,
-                IsSnapToTickEnabled = true
-            };
-            widthSliderRef = widthSlider;
-            var widthLbl = new TextBlock
-            {
-                Text = ((int)widthSlider.Value) + "px",
-                Foreground = new SolidColorBrush(_activeGlassAccent),
-                FontSize = 11,
-                Margin = new Thickness(0, 0, 0, 6)
-            };
-            widthLblRef = widthLbl;
-            ApplySliderTheme(widthSlider);
-            AttachOptionLegend(widthSlider, "Setzt die Fensterbreite des Overlays.");
-            widthSlider.ValueChanged += (_, _) =>
-            {
-                widthLbl.Text = ((int)widthSlider.Value) + "px";
-                if (_mainWin != null)
-                {
-                    _mainWin.Width = widthSlider.Value;
-                }
-                RepositionSettingsWindow();
-            };
-            sp.Children.Add(widthSlider);
-            sp.Children.Add(widthLbl);
-
-            var positionHint = new TextBlock
-            {
-                Text = Ui(
-                    "Position: Overlay einfach ziehen; Rand-Andocken erfolgt automatisch. Den kleinen Hover-Kreis direkt ziehen, um ihn auch auf einen anderen Monitor zu verschieben.",
-                    "Position: drag the overlay normally; edge docking is automatic. Drag the small hover dot itself to move it, including to another monitor."),
-                Foreground = new SolidColorBrush(Color.FromRgb(155, 170, 198)),
-                FontSize = 10,
-                Margin = new Thickness(0, 10, 0, 0),
-                TextWrapping = TextWrapping.Wrap
-            };
-            sp.Children.Add(positionHint);
-
-            win.Content = outer;
-            outer.Child = settingsScroll;
-
-            _settingsWin = win;
-            win.Closing += (_, e) =>
-            {
-                e.Cancel = false;
-                _isUserInteracting = false;
-                _settingsWin = null;
-                _settingsGlassBorder = null;
-                _settingsGameHookStatusTxt = null;
-                OnSettingsWindowClosed();
-            };
-
-            if (_edgeDockEnabled && _edgeDockActive)
-            {
-                _edgeDockVisibleUntilUtc = DateTime.UtcNow.AddMilliseconds(EdgeDockHoldMs);
-                ApplyEdgeDockPlacement(expand: true, force: true);
-            }
-
-            RepositionSettingsWindow();
-            ApplyGlassTheme();
-            SyncGlassLabels();
-            win.Show();
-            LocalizeVisualTree(settingsScroll);
-        }
-
-        private static void OnSettingsWindowClosed()
-        {
-            if (!IsDesktopOverlayMode())
-            {
-                _cornerRevealVisibleUntilUtc = DateTime.UtcNow;
-                ApplyCornerRevealVisualState(false);
-                UpdateCornerHintWindow();
-            }
-
-            FlushPendingPersistCurrentState();
-            PersistCurrentState();
-        }
-        private static void RepositionSettingsWindow()
-        {
-            if (_mainWin == null || _settingsWin == null)
-            {
-                return;
-            }
-
-            var left = _mainWin.Left + _mainWin.Width + 4;
-            var top = _mainWin.Top;
-
-            var screenLeft = SystemParameters.VirtualScreenLeft;
-            var screenTop = SystemParameters.VirtualScreenTop;
-            var screenRight = screenLeft + SystemParameters.VirtualScreenWidth;
-            var screenBottom = screenTop + SystemParameters.VirtualScreenHeight;
-
-            if (left + _settingsWin.Width > screenRight)
-            {
-                left = _mainWin.Left - _settingsWin.Width - 4;
-            }
-
-            if (left < screenLeft)
-            {
-                left = screenLeft;
-            }
-
-            if (top + _settingsWin.Height > screenBottom)
-            {
-                top = screenBottom - _settingsWin.Height;
-            }
-
-            if (top < screenTop)
-            {
-                top = screenTop;
-            }
-
-            _settingsWin.Left = left;
-            _settingsWin.Top = top;
-        }
-
         private static void OnWindowClosing(object? sender, System.ComponentModel.CancelEventArgs e)
         {
+            StopToggleHotkey();
             StopRefreshLoop();
             if (_sessionEventRefreshTimer != null)
             {
@@ -7596,10 +5019,12 @@ namespace MiniMixerOverlay.App
             ws.DockVisibleWidth = _edgeDockVisibleWidth;
             ws.DockRevealZoneWidth = _edgeDockRevealZoneWidth;
             ws.CornerSnapAnchor = SerializeCornerSnapAnchor(AlignCornerToDockSide(_rememberedSnapCorner, _edgeDockSide));
-            ws.AlwaysOnTop = _userAlwaysOnTop;
             ws.CornerHintManualPosition = _cornerHintManualPosition;
             ws.CornerHintX = _cornerHintManualPosition && double.IsFinite(_cornerHintManualX) ? _cornerHintManualX : null;
             ws.CornerHintY = _cornerHintManualPosition && double.IsFinite(_cornerHintManualY) ? _cornerHintManualY : null;
+            // Do not copy an incidental HWND state back into the user's
+            // checkbox setting. ApplyUserTopmostPreference reads this value;
+            // WriteCurrentStateToSettings must never overwrite it.
 
             _ctrl.Settings.Ui.VisibleApps = _visibleApps;
             _ctrl.Settings.Ui.RefreshIntervalMs = _refreshIntervalMs;
@@ -7607,9 +5032,11 @@ namespace MiniMixerOverlay.App
             _ctrl.Settings.Ui.CornerRevealEnabled = _cornerRevealEnabled;
             _ctrl.Settings.Ui.AutoApplyToAllNewApps = _autoApplyToAllNewApps;
             _ctrl.Settings.Ui.AutoVolumePercent = _autoVolumePercent;
+            _ctrl.Settings.Ui.AutoLimitMaxInstallAgeDays = _autoLimitMaxInstallAgeDays;
             _ctrl.Settings.Ui.OverlayMode = _overlayMode;
             _ctrl.Settings.Ui.Language = _uiLanguage;
             _ctrl.Settings.Ui.CornerHintShowDot = _cornerHintShowDot;
+            _ctrl.Settings.Ui.CornerHintTransparencyPercent = _cornerHintTransparencyPercent;
             _ctrl.Settings.Ui.CornerHintShowValue = _cornerHintShowValue;
             _ctrl.Settings.Ui.CornerHintValueColor = NormalizeCornerHintValueColor(_cornerHintValueColor);
             _ctrl.Settings.Ui.CornerHintUseCustomValueColor = _cornerHintUseCustomValueColor;
@@ -7727,12 +5154,6 @@ namespace MiniMixerOverlay.App
 
         private static IntPtr NoActivateWindowHook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (msg == WmNcHitTest && _clickThroughWindows.Contains(hwnd))
-            {
-                handled = true;
-                return new IntPtr(HtTransparent);
-            }
-
             if (msg == WmMouseActivate)
             {
                 handled = true;
@@ -7742,17 +5163,21 @@ namespace MiniMixerOverlay.App
             return IntPtr.Zero;
         }
 
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint virtualKey);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnregisterHotKey(IntPtr hwnd, int id);
+
         private const int WmMouseActivate = 0x0021;
-        private const int WmNcHitTest = 0x0084;
         private const int MaNoActivate = 3;
-        private const int HtTransparent = -1;
         private const int GwlExStyle = -20;
         private const long WsExNoActivate = 0x08000000L;
-        private const long WsExTransparent = 0x00000020L;
         private const uint SwpNoSize = 0x0001;
         private const uint SwpNoMove = 0x0002;
         private const uint SwpNoActivate = 0x0010;
-        private const uint SwpFrameChanged = 0x0020;
         private const uint SwpShowWindow = 0x0040;
         private const int SwShow = 5;
         private const int SwShowNoActivate = 4;
@@ -7777,31 +5202,6 @@ namespace MiniMixerOverlay.App
             public int Bottom;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct NativeCursorInfo
-        {
-            public int CbSize;
-            public int Flags;
-            public IntPtr HCursor;
-            public NativePoint ScreenPos;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct NativeGuiThreadInfo
-        {
-            public int CbSize;
-            public int Flags;
-            public IntPtr HwndActive;
-            public IntPtr HwndFocus;
-            public IntPtr HwndCapture;
-            public IntPtr HwndMenuOwner;
-            public IntPtr HwndMoveSize;
-            public IntPtr HwndCaret;
-            public NativeRect CaretRect;
-        }
-
-        private const int CursorShowing = 0x00000001;
-
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         private struct MonitorInfo
         {
@@ -7813,21 +5213,6 @@ namespace MiniMixerOverlay.App
 
         [DllImport("user32.dll")]
         private static extern bool GetCursorPos(out NativePoint point);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool GetCursorInfo(ref NativeCursorInfo cursorInfo);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool GetClipCursor(out NativeRect rect);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool GetGUIThreadInfo(uint idThread, ref NativeGuiThreadInfo guiThreadInfo);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool GetWindowRect(IntPtr hWnd, out NativeRect rect);
 
         [DllImport("user32.dll")]
         private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
