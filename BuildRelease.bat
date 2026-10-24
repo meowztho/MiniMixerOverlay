@@ -2,17 +2,37 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
-set "RID=win-x64"
-set "VERSION=%~1"
-if "%VERSION%"=="" set "VERSION=1.0.0"
-set "PUBLISH_DIR=%CD%\dist\publish\%RID%"
-set "INSTALLER_DIR=%CD%\dist\installer"
-set "PROJECT=%CD%\src\MiniMixerOverlay.App\MiniMixerOverlay.App.csproj"
-set "ISS=%CD%\tools\installer\MiniMixerOverlay.iss"
+rem Do not remove a running Preview EXE/DLL from its staging directory.
+rem A locked file can leave the existing package partially deleted.
+tasklist /NH /FI "IMAGENAME eq MiniMixerOverlay.App.exe" 2>nul | findstr /I /C:"MiniMixerOverlay.App.exe" >nul
+if not errorlevel 1 (
+  echo ERROR: MiniMixer is still running. Exit via tray before rebuilding the native package.
+  exit /b 2
+)
 
-echo [1/3] Publishing MiniMixerOverlay %VERSION% for %RID%...
-if exist "%PUBLISH_DIR%" rmdir /s /q "%PUBLISH_DIR%"
-dotnet publish "%PROJECT%" ^
+rem Explicit NON-PRODUCTION, GOverlay-free staging package.
+rem Until a separately verified native attach/detach provider exists,
+rem do not offer a normal installer or label this package Stable.
+set "RID=win-x64"
+set "PUBLISH_DIR=dist\SingleFile\%RID%"
+set "PACKAGE_DIR=dist\NativePreview\MiniMixerOverlay-%RID%"
+set "NATIVE_SOURCE=.tmp\NativeCandidate\LiveInGame\MiniMixerLivePresent.x64.dll"
+set "NATIVE_LICENSE=native\third_party\minhook-1.3.4\LICENSE.txt"
+
+echo [1/4] Build independent native D3D12 candidate...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "native\GameHook\candidate\build-live-present-dll.ps1"
+if errorlevel 1 exit /b 1
+if not exist "%NATIVE_SOURCE%" (
+  echo ERROR: Native DLL missing. No package created.
+  exit /b 1
+)
+if not exist "%NATIVE_LICENSE%" (
+  echo ERROR: Pinned MinHook license missing.
+  exit /b 1
+)
+
+echo [2/4] Publish WPF app as self-contained single file...
+dotnet publish src\MiniMixerOverlay.App\MiniMixerOverlay.App.csproj ^
   -c Release ^
   -r %RID% ^
   --self-contained true ^
@@ -21,50 +41,29 @@ dotnet publish "%PROJECT%" ^
   -p:PublishTrimmed=false ^
   -p:DebugType=None ^
   -p:DebugSymbols=false ^
-  -p:Version=%VERSION% ^
   -o "%PUBLISH_DIR%"
-if errorlevel 1 goto :fail
+if errorlevel 1 exit /b 1
+if not exist "%PUBLISH_DIR%\MiniMixerOverlay.App.exe" exit /b 1
 
-if not exist "%PUBLISH_DIR%\MiniMixerOverlay.App.exe" (
-  echo ERROR: Published executable not found.
-  goto :fail
-)
+echo [3/4] Stage NATIVE PREVIEW, no GOverlay or installer...
+if exist "%PACKAGE_DIR%" rmdir /s /q "%PACKAGE_DIR%"
+mkdir "%PACKAGE_DIR%\native\GameHook\candidate"
+if errorlevel 1 exit /b 1
+copy /Y "%PUBLISH_DIR%\MiniMixerOverlay.App.exe" "%PACKAGE_DIR%\MiniMixerOverlay.App.exe" >nul
+if errorlevel 1 exit /b 1
+copy /Y "%NATIVE_SOURCE%" "%PACKAGE_DIR%\native\GameHook\candidate\MiniMixerLivePresent.x64.dll" >nul
+if errorlevel 1 exit /b 1
+copy /Y "%NATIVE_LICENSE%" "%PACKAGE_DIR%\MINHOOK-LICENSE.txt" >nul
+if errorlevel 1 exit /b 1
+copy /Y "tools\native-preview\README_NATIVE_PREVIEW.txt" "%PACKAGE_DIR%\README_NATIVE_PREVIEW.txt" >nul
+if errorlevel 1 exit /b 1
 
-if not exist "%PUBLISH_DIR%\Logo.png" (
-  echo ERROR: Logo.png was not copied to the publish directory.
-  goto :fail
-)
-if not exist "%PUBLISH_DIR%\AppIcon.ico" (
-  echo ERROR: AppIcon.ico was not copied to the publish directory.
-  goto :fail
-)
-
-echo [2/3] Locating Inno Setup compiler...
-set "ISCC="
-for %%I in (iscc.exe ISCC.exe) do (
-  for /f "delims=" %%P in ('where %%I 2^>nul') do if not defined ISCC set "ISCC=%%P"
-)
-if not defined ISCC if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if not defined ISCC if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe"
-if not defined ISCC (
-  echo ERROR: Inno Setup 6 was not found.
-  echo Install Inno Setup 6, then run BuildRelease.bat again.
-  exit /b 2
-)
-
-if not exist "%INSTALLER_DIR%" mkdir "%INSTALLER_DIR%"
-
-echo [3/3] Building installer...
-"%ISCC%" /DMyAppVersion=%VERSION% /DSourceDir="%PUBLISH_DIR%" /O"%INSTALLER_DIR%" "%ISS%"
-if errorlevel 1 goto :fail
+echo [4/4] Fail-closed vendor-free package validation...
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "tools\verify-native-preview-assets.ps1" -PackageDir "%PACKAGE_DIR%" -SourceDll "%NATIVE_SOURCE%"
+if errorlevel 1 exit /b 1
 
 echo.
-echo Done.
-echo Published EXE: %PUBLISH_DIR%\MiniMixerOverlay.App.exe
-echo Installer:     %INSTALLER_DIR%\MiniMixerOverlay-Setup-%VERSION%-win-x64.exe
+echo PASS: Native preview assembled WITHOUT any GOverlay injector/DLL.
+echo PACKAGE: %PACKAGE_DIR%
+echo IMPORTANT: No verified production native injector yet. No auto-hook release.
 exit /b 0
-
-:fail
-echo.
-echo Build failed.
-exit /b 1

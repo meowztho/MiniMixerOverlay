@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "project": "Mini Mixer Overlay",
+  "repository_root": ".",
+  "control_plane_root": ".",
+  "runnable_project": "src/MiniMixerOverlay.App/MiniMixerOverlay.App.csproj",
+  "truth_policy": {
+    "product": "Docs/00_VISION.md and Docs/01_PRODUCT_REQUIREMENTS.md",
+    "realization": "Docs/03_TECH_ARCHITECTURE.md and Docs/07_ROADMAP.md",
+    "verification": "ACCEPTANCE_MATRIX.yaml and Docs/RORE_REFERENCE_TRUTH_2026-10-17.md",
+    "note": "User report, static code evidence and verified runtime behavior are distinct."
+  },
+  "authorities": {
+    "vision": {
+      "path": "Docs/00_VISION.md",
+      "role": "product_truth"
+    },
+    "product_requirements": {
+      "path": "Docs/01_PRODUCT_REQUIREMENTS.md",
+      "role": "product_truth"
+    },
+    "design": {
+      "path": "Docs/02_UX_UI_DESIGN.md",
+      "role": "product_truth"
+    },
+    "architecture_and_contracts": {
+      "path": "Docs/03_TECH_ARCHITECTURE.md",
+      "role": "realization_truth"
+    },
+    "audio_lifecycle": {
+      "path": "Docs/04_AUDIO_SESSION_LOGIC.md",
+      "role": "realization_truth"
+    },
+    "guard_policy": {
+      "path": "Docs/05_GUARD_AND_RULES.md",
+      "role": "product_rule"
+    },
+    "persistence_schema": {
+      "path": "Docs/06_DATA_MODEL.md",
+      "role": "data_contract"
+    },
+    "project_plan": {
+      "path": "Docs/07_ROADMAP.md",
+      "role": "admission_and_stage_owner"
+    },
+    "development_rules": {
+      "path": "Docs/08_DEV_RULES.md",
+      "role": "engineering_guardrails"
+    },
+    "release": {
+      "path": "Docs/09_RELEASE_INSTALL.md",
+      "role": "release_contract"
+    },
+    "decisions_and_provenance": {
+      "path": "Docs/10_DECISIONS_AND_EVIDENCE.md",
+      "role": "decisions_open_questions_and_evidence_classification"
+    },
+    "acceptance": {
+      "path": "ACCEPTANCE_MATRIX.yaml",
+      "role": "acceptance_owner"
+    },
+    "reference_reconstruction": {
+      "path": "Docs/RORE_REFERENCE_TRUTH_2026-10-17.md",
+      "role": "revision_bound_non_normative_reference_evidence"
+    }
+  },
+  "entrypoints": [
+    "AGENTS.md",
+    "PROJECT_INDEX.yaml"
+  ],
+  "workstreams": {
+    "guard": [
+      "Docs/01_PRODUCT_REQUIREMENTS.md",
+      "Docs/05_GUARD_AND_RULES.md",
+      "Docs/03_TECH_ARCHITECTURE.md",
+      "Docs/07_ROADMAP.md",
+      "ACCEPTANCE_MATRIX.yaml",
+      "Docs/RORE_REFERENCE_TRUTH_2026-10-17.md"
+    ],
+    "desktop_audio": [
+      "Docs/01_PRODUCT_REQUIREMENTS.md",
+      "Docs/02_UX_UI_DESIGN.md",
+      "Docs/04_AUDIO_SESSION_LOGIC.md",
+      "Docs/03_TECH_ARCHITECTURE.md",
+      "Docs/07_ROADMAP.md",
+      "ACCEPTANCE_MATRIX.yaml"
+    ],
+    "game_hook": [
+      "Docs/01_PRODUCT_REQUIREMENTS.md",
+      "Docs/02_UX_UI_DESIGN.md",
+      "Docs/03_TECH_ARCHITECTURE.md",
+      "Docs/07_ROADMAP.md",
+      "Docs/10_DECISIONS_AND_EVIDENCE.md",
+      "ACCEPTANCE_MATRIX.yaml",
+      "Docs/RORE_REFERENCE_TRUTH_2026-10-17.md"
+    ],
+    "release": [
+      "Docs/09_RELEASE_INSTALL.md",
+      "Docs/07_ROADMAP.md",
+      "ACCEPTANCE_MATRIX.yaml",
+      "Docs/RORE_REFERENCE_TRUTH_2026-10-17.md"
+    ]
+  },
+  "verification_command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/verify-project-authorities.ps1",
+  "package_maturity": "compiled_static_authorities_only_not_runtime_verified"
+}
